@@ -35,4 +35,8 @@ namespace Horizon
 	void ExitTrace(const char* message);
 
 	void AuditHeapToExitTrace(const char* when);
+	/// Makes [addr, addr+size) read-only and reports whether the kernel allowed
+	/// it. Under kaiHEN, EE RAM rejects this (0xd401) even where a small fresh
+	/// heap page accepts it, so callers must test the memory they mean to protect.
+	bool TryWriteProtect(void* addr, size_t size);
 } // namespace Horizon

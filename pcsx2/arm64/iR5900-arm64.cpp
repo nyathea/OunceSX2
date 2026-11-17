@@ -2214,12 +2214,59 @@ u32 recTestColdIslandBodiesEmitted()
 }
 #endif
 
+// True while recEmitColdSideExits emits into the cold arena. Side-exit bodies
+// recompile their delay slot there, and a delay-slot instruction can itself ask
+// for a cold island (every vtlb access does without fastmem). No hot block is
+// open to hold the island by then, so such requests are emitted inline.
+static bool s_inColdSession = false;
+
+// Inline form of a cold island: B.cond over the fast code to the body, which
+// then branches back past it.
+static void recEmitInlineIslandBranch(a64::Condition cond, const std::function<void()>& fast,
+	const std::function<void()>& body)
+{
+	a64::Label slow, done;
+	armAsm->B(&slow, cond);
+	if (fast)
+		fast();
+	armAsm->B(&done);
+	armAsm->Bind(&slow);
+	body();
+	armAsm->Bind(&done);
+}
+
 void recEmitColdIslandBranch(a64::Condition cond, std::function<void()> body)
 {
+	if (s_inColdSession)
+	{
+		recEmitInlineIslandBranch(cond, nullptr, body);
+		return;
+	}
 	ColdIsland x;
 	x.label = std::make_unique<a64::Label>();
 	x.body = std::move(body);
 	armAsm->B(x.label.get(), cond);
+	x.resume = armGetCurrentCodePointer();
+	s_coldIslands.push_back(std::move(x));
+}
+
+// Like recEmitColdIslandBranch, but the cold body resumes AFTER `fast`, the
+// inline code the taken branch skips. The no-fastmem vtlb path uses it: the
+// inline lookup branches on a handler page, and the direct host access that
+// follows must not run again once the outlined handler call returns.
+void recEmitColdIslandBranchAround(a64::Condition cond, const std::function<void()>& fast,
+	std::function<void()> body)
+{
+	if (s_inColdSession)
+	{
+		recEmitInlineIslandBranch(cond, fast, body);
+		return;
+	}
+	ColdIsland x;
+	x.label = std::make_unique<a64::Label>();
+	x.body = std::move(body);
+	armAsm->B(x.label.get(), cond);
+	fast();
 	x.resume = armGetCurrentCodePointer();
 	s_coldIslands.push_back(std::move(x));
 }
@@ -2279,7 +2326,8 @@ static void recEmitSideExitTail(u32 imm)
 
 // Island → cold-body patch: same single-word B rewrite + cache maintenance
 // protocol as Arm64BaseBlocks link patching (compile-thread only here).
-static void recPatchIslandB(u8* site, const u8* target)
+// The caller flushes (recEmitColdSideExits batches every island of a block).
+static void recWriteIslandB(u8* site, const u8* target)
 {
 	const intptr_t imm26 = (reinterpret_cast<intptr_t>(target) - reinterpret_cast<intptr_t>(site)) >> 2;
 	pxAssertRel(imm26 >= -(1 << 25) && imm26 < (1 << 25), "Cold-exit island out of B imm26 range");
@@ -2287,7 +2335,6 @@ static void recPatchIslandB(u8* site, const u8* target)
 	// block, whose window armEndBlock() already closed by the time the cold
 	// session patches them.
 	armPatchCodeWord(site, 0x14000000u | (static_cast<u32>(imm26) & 0x03FFFFFFu));
-	HostSys::FlushInstructionCache(site, 4);
 }
 
 // Emit every pending side exit body into the cold arena (a second emission
@@ -2306,6 +2353,7 @@ static void recEmitColdSideExits()
 
 	armSetAsmPtr(s_coldPtr, s_coldPtrEnd - s_coldPtr + _64kb, &s_eeConstantPool);
 	armStartBlock();
+	s_inColdSession = true;
 	for (int k = 0; k < n; k++)
 	{
 		SuperblockSideExit& x = s_sideExits[k];
@@ -2330,16 +2378,32 @@ static void recEmitColdSideExits()
 		++s_coldIslandBodiesEmitted;
 #endif
 	}
+	s_inColdSession = false;
 	pxAssert(armGetCurrentCodePointer() < SysMemory::GetEERecEnd());
 	s_coldPtr = armEndBlock();
 
 	// Each island patch opens its own write scope (armPatchCodeWord); an
 	// arena-wide Begin/EndCodeWrite here would RX-flip a concurrently open
 	// MTVU emit window in Legacy mode on its way out.
+	//
+	// The cache maintenance is batched into one call: on Switch 2 each flush is
+	// a kaihenJitPublishRanges IPC to RO, and without fastmem every load/store
+	// site owns an island, so per-island flushes cost dozens of round trips per
+	// compiled block. The cold bodies were published by armEndBlock above,
+	// before any island points at them.
+	std::vector<std::pair<void*, u32>> flush;
+	flush.reserve(static_cast<size_t>(n) + s_coldIslands.size());
 	for (int k = 0; k < n; k++)
-		recPatchIslandB(s_sideExitIslands[k], coldStart[k]);
+	{
+		recWriteIslandB(s_sideExitIslands[k], coldStart[k]);
+		flush.emplace_back(s_sideExitIslands[k], 4u);
+	}
 	for (const ColdIsland& x : s_coldIslands)
-		recPatchIslandB(x.island, x.cold);
+	{
+		recWriteIslandB(x.island, x.cold);
+		flush.emplace_back(x.island, 4u);
+	}
+	HostSys::FlushInstructionCacheRanges(flush.data(), flush.size());
 	s_coldIslands.clear();
 
 	g_branch = 1;
@@ -3601,7 +3665,7 @@ static bool memory_protect_recompiled_code(u32 startpc, u32 size)
 	// The EENULL thread context register is stored @ 0x81000-....
 	const bool contains_thread_stack = ((startpc >> 12) == 0x81) || ((startpc >> 12) == 0x80001);
 
-	const vtlb_ProtectionMode PageType = contains_thread_stack ? ProtMode_Manual : mmap_GetRamPageInfo(inpage_ptr);
+	vtlb_ProtectionMode PageType = contains_thread_stack ? ProtMode_Manual : mmap_GetRamPageInfo(inpage_ptr);
 
 	switch (PageType)
 	{
@@ -3612,7 +3676,12 @@ static bool memory_protect_recompiled_code(u32 startpc, u32 size)
 		case ProtMode_Write:
 			mmap_MarkCountedRamPage(inpage_ptr);
 			manual_page[inpage_ptr >> 12] = 0;
-			break;
+			// Without host write protection the page comes back manual from
+			// its very first compile; this block needs the entry check too.
+			if (mmap_GetRamPageInfo(inpage_ptr) != ProtMode_Manual)
+				break;
+			PageType = ProtMode_Manual; // keeps the block out of SL-1 residency
+			[[fallthrough]];
 
 		case ProtMode_Manual:
 		{
@@ -3699,7 +3768,10 @@ static bool memory_protect_recompiled_code(u32 startpc, u32 size)
 
 			// Counted blocks: track how often this block runs. If the counter overflows,
 			// reset the page to write-protected mode (faster than manual checks).
-			if (!contains_thread_stack && manual_counter[inpage_ptr >> 12] <= 3)
+			// Pointless without host write protection: the page reset would
+			// only recompile the page and land it back in manual mode.
+			if (!contains_thread_stack && mmap_HostWriteProtectAvailable() &&
+				manual_counter[inpage_ptr >> 12] <= 3)
 			{
 				armMoveAddressToReg(RSCRATCHADDR, &manual_page[inpage_ptr >> 12]);
 				armAsm->Ldrh(RWSCRATCH, a64::MemOperand(RSCRATCHADDR));
@@ -3778,7 +3850,9 @@ static void recReserve()
 	// Same slop discipline as the hot region: a session's capacity grant is
 	// (end - ptr + 64KB), so each region's ptr-end sits one slop below the
 	// next region's base and an overhanging emission can never cross it.
-	const u32 coldArenaSize = 8 * _1mb;
+	// Without fastmem every load/store site also outlines its vtlb slow path
+	// here (vtlb_EmitOutlinedSlowPath), so the arena gets twice the room.
+	const u32 coldArenaSize = CHECK_FASTMEM ? 8 * _1mb : 16 * _1mb;
 	s_coldBase = poolBase - coldArenaSize;
 	s_coldPtr = s_coldBase;
 	s_coldPtrEnd = poolBase - _64kb;

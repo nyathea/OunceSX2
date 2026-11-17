@@ -36,6 +36,9 @@
 #include <ctime>
 #include <limits>
 #include <malloc.h>
+#ifdef __SWITCH2__
+#include <switch2/memory/heap.h>
+#endif
 #include <map>
 #include <memory>
 #include <mutex>
@@ -1079,6 +1082,12 @@ namespace
 
 	std::size_t FreeHeapBytes()
 	{
+#ifdef __SWITCH2__
+		// libounce's mimalloc keeps no newlib figures: mallinfo() is all zeros
+		// and fake_heap_start == fake_heap_end once it owns the heap, so the
+		// newlib arithmetic below would always report 0 free bytes.
+		return static_cast<std::size_t>(heapGetFreeSize());
+#endif
 		const struct mallinfo info = mallinfo();
 		const std::size_t heap = static_cast<std::size_t>(fake_heap_end - fake_heap_start);
 		const std::size_t used = std::min<std::size_t>(heap, info.arena);

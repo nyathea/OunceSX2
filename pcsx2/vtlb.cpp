@@ -29,6 +29,7 @@
 #endif
 
 #ifdef __SWITCH__
+#include "common/Horizon/Horizon.h"
 #include "common/Horizon/HorizonFastmem.h"
 #endif
 
@@ -1552,6 +1553,15 @@ vtlb_ProtectionMode mmap_GetRamPageInfo(u32 paddr)
 	return m_PageProtectInfo[rampage].Mode;
 }
 
+// Set once a code page fails to write-protect. Every page then uses manual
+// protection: it is one allocation, so the next page would fail the same way.
+static bool s_host_write_protect_failed = false;
+
+bool mmap_HostWriteProtectAvailable()
+{
+	return !s_host_write_protect_failed;
+}
+
 // paddr - physically mapped PS2 address
 void mmap_MarkCountedRamPage(u32 paddr)
 {
@@ -1578,6 +1588,16 @@ void mmap_MarkCountedRamPage(u32 paddr)
 
 	m_PageProtectInfo[rampage].ReverseRamMap = paddr;
 
+	// No host write protection (kaiHEN): a page marked protected would never
+	// fault, and blocks compiled from code the game later overwrites (Ratchet &
+	// Clank loading a planet's overlay) would keep running stale. Use manual
+	// protection instead: every block in the page checks its code on entry.
+	if (s_host_write_protect_failed)
+	{
+		m_PageProtectInfo[rampage].Mode = ProtMode_Manual;
+		return;
+	}
+
 	if (m_PageProtectInfo[rampage].Mode == ProtMode_Write)
 		return; // skip town if we're already protected.
 
@@ -1586,8 +1606,19 @@ void mmap_MarkCountedRamPage(u32 paddr)
 						   "Protected page @ 0x%05x",
 		paddr >> __pageshift);
 
+#ifdef __SWITCH__
+	// Test the protection itself: MemProtect fails silently.
+	if (!Horizon::TryWriteProtect(&eeMem->Main[rampage << __pageshift], __pagesize))
+	{
+		s_host_write_protect_failed = true;
+		m_PageProtectInfo[rampage].Mode = ProtMode_Manual;
+		return;
+	}
+	m_PageProtectInfo[rampage].Mode = ProtMode_Write;
+#else
 	m_PageProtectInfo[rampage].Mode = ProtMode_Write;
 	HostSys::MemProtect(&eeMem->Main[rampage << __pageshift], __pagesize, PageAccess_ReadOnly());
+#endif
 	// Narrowing is safe, the bound above keeps this under ExposedRam.
 	vtlb_UpdateFastmemProtection(static_cast<u32>(rampage << __pageshift), __pagesize, PageAccess_ReadOnly());
 }

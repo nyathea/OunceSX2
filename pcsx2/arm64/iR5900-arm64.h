@@ -734,6 +734,9 @@ vixl::aarch64::Label* recSuperblockAddSideExit(u32 branch_target, bool need_dela
 
 // B.cond to an island whose body is emitted in the cold arena at block end.
 void recEmitColdIslandBranch(vixl::aarch64::Condition cond, std::function<void()> body);
+// Same, but the island's body resumes after `fast` (inline code the branch skips).
+void recEmitColdIslandBranchAround(vixl::aarch64::Condition cond, const std::function<void()>& fast,
+	std::function<void()> body);
 #ifdef PCSX2_RECOMPILER_TESTS
 u32 recTestColdIslandBodiesEmitted();
 #endif

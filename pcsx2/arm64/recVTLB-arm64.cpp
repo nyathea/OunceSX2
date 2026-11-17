@@ -243,124 +243,131 @@ static void vtlbGetLiveRegisterMasks(u32& gpr_bitmask, u32& fpr_bitmask)
 		fpr_bitmask |= (1u << NEON_RESERVED_COP2_CLAMPMAX) | (1u << NEON_RESERVED_COP2_CLAMPMIN);
 }
 
-// Emit a single fastmem load instruction and register backpatch info.
-// addr_wreg: W register index holding the 32-bit guest virtual address
-// dest_reg: register index where the result goes (W or X based on bits)
-// Result is in dest_reg after the load (or after backpatch thunk on fault).
+// True when a load/store takes the register-preserving emit shape (no
+// iFlushCall): a real fastmem access, or, with no fastmem arena (Switch 2
+// under kaiHEN), the inline vtlb lookup with an outlined slow path. Faulting
+// PCs only exist with fastmem; they keep the flushed softmem fallback.
+static __fi bool recUseFastPath()
+{
+	return !CHECK_FASTMEM || !vtlb_IsFaultingPC(pc);
+}
+
+// Emit one guest memory access in the fastmem shape. `access` emits exactly one
+// load or store instruction against the MemOperand it is given.
+//
+// Fastmem: [RFASTMEMBASE, w_addr, UXTW] plus backpatch info.
+//
+// No fastmem (RFASTMEMBASE holds vtlbdata.vmap):
+//     lsr  w8, w_addr, #VTLB_PAGE_BITS
+//     ldr  x8, [x19, x8, lsl #3]        ; vmap entry
+//     adds x8, x8, w_addr, uxtw         ; host pointer, N = handler page
+//     b.mi island                       ; cold: save live regs, call handler
+//     <access> [x8]
+// resume:
+// Four instructions over fastmem and no register eviction. Only x8 is touched,
+// which is outside the allocator pool; the address and data registers are
+// left intact for the slow path.
+template <typename AccessFn>
+static void vtlbEmitAccess(int addr_wreg, int data_reg, u32 bits, bool sign, bool is_load, bool is_fpr,
+	const AccessFn& access)
+{
+	u32 gpr_bitmask, fpr_bitmask;
+	vtlbGetLiveRegisterMasks(gpr_bitmask, fpr_bitmask);
+
+	if (CHECK_FASTMEM)
+	{
+		const u8* codeStart = armGetCurrentCodePointer();
+		access(a64::MemOperand(RFASTMEMBASE, armWRegister(addr_wreg), a64::UXTW));
+		vtlb_AddLoadStoreInfo((uptr)codeStart, 4, pc, gpr_bitmask, fpr_bitmask,
+			static_cast<u8>(addr_wreg), static_cast<u8>(data_reg),
+			static_cast<u8>(bits), sign, is_load, is_fpr);
+		return;
+	}
+
+	const a64::Register waddr = armWRegister(addr_wreg);
+	armAsm->Lsr(a64::w8, waddr, VTLB_PAGE_BITS);
+	armAsm->Ldr(a64::x8, a64::MemOperand(RFASTMEMBASE, a64::x8, a64::LSL, 3));
+	armAsm->Adds(a64::x8, a64::x8, a64::Operand(waddr, a64::UXTW));
+
+	const u32 guest_pc = pc;
+	const u8 a = static_cast<u8>(addr_wreg);
+	const u8 d = static_cast<u8>(data_reg);
+	const u8 b = static_cast<u8>(bits);
+	recEmitColdIslandBranchAround(a64::mi,
+		[&]() { access(a64::MemOperand(a64::x8)); },
+		[=]() { vtlb_EmitOutlinedSlowPath(guest_pc, gpr_bitmask, fpr_bitmask, a, d, b, sign, is_load, is_fpr); });
+}
+
+// Emit a guest load into dest_reg (W or X based on bits).
 static void vtlbFastmemRead(int addr_wreg, int dest_reg, u32 bits, bool sign)
 {
-	u32 gpr_bitmask, fpr_bitmask;
-	vtlbGetLiveRegisterMasks(gpr_bitmask, fpr_bitmask);
-
-	const u8* codeStart = armGetCurrentCodePointer();
-
-	a64::MemOperand mem(RFASTMEMBASE, armWRegister(addr_wreg), a64::UXTW);
-	switch (bits)
-	{
-		case 8:
-			if (sign)
-				armAsm->Ldrsb(armXRegister(dest_reg), mem);
-			else
-				armAsm->Ldrb(armWRegister(dest_reg), mem);
-			break;
-		case 16:
-			if (sign)
-				armAsm->Ldrsh(armXRegister(dest_reg), mem);
-			else
-				armAsm->Ldrh(armWRegister(dest_reg), mem);
-			break;
-		case 32:
-			if (sign)
-				armAsm->Ldrsw(armXRegister(dest_reg), mem);
-			else
-				armAsm->Ldr(armWRegister(dest_reg), mem);
-			break;
-		case 64:
-			armAsm->Ldr(armXRegister(dest_reg), mem);
-			break;
-	}
-
-	vtlb_AddLoadStoreInfo((uptr)codeStart, 4, pc, gpr_bitmask, fpr_bitmask,
-		static_cast<u8>(addr_wreg), static_cast<u8>(dest_reg),
-		static_cast<u8>(bits), sign, true, false);
+	vtlbEmitAccess(addr_wreg, dest_reg, bits, sign, true, false, [&](const a64::MemOperand& mem) {
+		switch (bits)
+		{
+			case 8:
+				if (sign)
+					armAsm->Ldrsb(armXRegister(dest_reg), mem);
+				else
+					armAsm->Ldrb(armWRegister(dest_reg), mem);
+				break;
+			case 16:
+				if (sign)
+					armAsm->Ldrsh(armXRegister(dest_reg), mem);
+				else
+					armAsm->Ldrh(armWRegister(dest_reg), mem);
+				break;
+			case 32:
+				if (sign)
+					armAsm->Ldrsw(armXRegister(dest_reg), mem);
+				else
+					armAsm->Ldr(armWRegister(dest_reg), mem);
+				break;
+			case 64:
+				armAsm->Ldr(armXRegister(dest_reg), mem);
+				break;
+		}
+	});
 }
 
-// Emit a single fastmem store instruction and register backpatch info.
+// Emit a guest store of value_reg.
 static void vtlbFastmemWrite(int addr_wreg, int value_reg, u32 bits)
 {
-	u32 gpr_bitmask, fpr_bitmask;
-	vtlbGetLiveRegisterMasks(gpr_bitmask, fpr_bitmask);
-
-	const u8* codeStart = armGetCurrentCodePointer();
-
-	a64::MemOperand mem(RFASTMEMBASE, armWRegister(addr_wreg), a64::UXTW);
-	switch (bits)
-	{
-		case 8:  armAsm->Strb(armWRegister(value_reg), mem); break;
-		case 16: armAsm->Strh(armWRegister(value_reg), mem); break;
-		case 32: armAsm->Str(armWRegister(value_reg), mem);  break;
-		case 64: armAsm->Str(armXRegister(value_reg), mem);  break;
-	}
-
-	vtlb_AddLoadStoreInfo((uptr)codeStart, 4, pc, gpr_bitmask, fpr_bitmask,
-		static_cast<u8>(addr_wreg), static_cast<u8>(value_reg),
-		static_cast<u8>(bits), false, false, false);
+	vtlbEmitAccess(addr_wreg, value_reg, bits, false, false, false, [&](const a64::MemOperand& mem) {
+		switch (bits)
+		{
+			case 8:  armAsm->Strb(armWRegister(value_reg), mem); break;
+			case 16: armAsm->Strh(armWRegister(value_reg), mem); break;
+			case 32: armAsm->Str(armWRegister(value_reg), mem);  break;
+			case 64: armAsm->Str(armXRegister(value_reg), mem);  break;
+		}
+	});
 }
 
-// Emit a single 128-bit fastmem load (LDR Q<n>, [RFASTMEMBASE, w_addr, UXTW]).
-// dest_qreg 0 = the legacy q0-temp shape (LQC2, LQ-to-r0 — caller must have
-// iFlushCall'd so q0 is allocator-detached); GE-14 passes an allocated
-// NEONTYPE_GPRREG slot and the backpatch thunk lands the slow-path result
-// there. Mirrors x86 PCSX2's alloc-callback MOVAPS pattern (ix86-32/recVTLB.cpp).
+// 128-bit load into q<dest_qreg>. dest_qreg 0 = the legacy q0-temp shape
+// (LQC2, LQ-to-r0 — caller must have iFlushCall'd so q0 is allocator-detached);
+// GE-14 passes an allocated NEONTYPE_GPRREG slot and the slow path lands the
+// result there. Mirrors x86 PCSX2's alloc-callback MOVAPS pattern.
 static void vtlbFastmemRead128(int addr_wreg, int dest_qreg)
 {
-	u32 gpr_bitmask, fpr_bitmask;
-	vtlbGetLiveRegisterMasks(gpr_bitmask, fpr_bitmask);
-
-	const u8* codeStart = armGetCurrentCodePointer();
-	armAsm->Ldr(a64::QRegister(dest_qreg),
-		a64::MemOperand(RFASTMEMBASE, armWRegister(addr_wreg), a64::UXTW));
-
-	vtlb_AddLoadStoreInfo((uptr)codeStart, 4, pc, gpr_bitmask, fpr_bitmask,
-		static_cast<u8>(addr_wreg), static_cast<u8>(dest_qreg),
-		/*size_in_bits*/ 128, /*is_signed*/ false, /*is_load*/ true, /*is_fpr*/ true);
+	vtlbEmitAccess(addr_wreg, dest_qreg, 128, false, true, true,
+		[&](const a64::MemOperand& mem) { armAsm->Ldr(a64::QRegister(dest_qreg), mem); });
 }
 
-// Emit a single 32-bit fastmem load straight into an allocated FPR NEON slot
-// (LDR S<n>, [RFASTMEMBASE, w_addr, UXTW]) — GE-10, the x86-master/4248
-// dest-alloc-callback model. The backpatch thunk's is_fpr load tail already
-// lands the slow-path C-handler result with Fmov S<n>, w0, and its save-mask
-// logic skips the load dest (RecStubs.cpp).
+// 32-bit load straight into an allocated FPR NEON slot (LDR S<n>) — GE-10. The
+// slow path lands the handler result with Fmov S<n>, w0 and skips the load
+// dest from its save set.
 static void vtlbFastmemReadFPR32(int addr_wreg, int dest_neonreg)
 {
-	u32 gpr_bitmask, fpr_bitmask;
-	vtlbGetLiveRegisterMasks(gpr_bitmask, fpr_bitmask);
-
-	const u8* codeStart = armGetCurrentCodePointer();
-	armAsm->Ldr(a64::SRegister(dest_neonreg),
-		a64::MemOperand(RFASTMEMBASE, armWRegister(addr_wreg), a64::UXTW));
-
-	vtlb_AddLoadStoreInfo((uptr)codeStart, 4, pc, gpr_bitmask, fpr_bitmask,
-		static_cast<u8>(addr_wreg), static_cast<u8>(dest_neonreg),
-		/*size_in_bits*/ 32, /*is_signed*/ false, /*is_load*/ true, /*is_fpr*/ true);
+	vtlbEmitAccess(addr_wreg, dest_neonreg, 32, false, true, true,
+		[&](const a64::MemOperand& mem) { armAsm->Ldr(a64::SRegister(dest_neonreg), mem); });
 }
 
-// Emit a single 128-bit fastmem store (STR Q<n>, [RFASTMEMBASE, w_addr, UXTW]).
-// src_qreg 0 = the legacy q0-temp shape (SQC2 — caller iFlushCall'd first);
-// GE-14 passes the allocator-resident source quad and the backpatch thunk's
-// slow path hands it to the C write handler.
+// 128-bit store from q<src_qreg>. src_qreg 0 = the legacy q0-temp shape (SQC2 —
+// caller iFlushCall'd first); GE-14 passes the allocator-resident source quad.
 static void vtlbFastmemWrite128(int addr_wreg, int src_qreg)
 {
-	u32 gpr_bitmask, fpr_bitmask;
-	vtlbGetLiveRegisterMasks(gpr_bitmask, fpr_bitmask);
-
-	const u8* codeStart = armGetCurrentCodePointer();
-	armAsm->Str(a64::QRegister(src_qreg),
-		a64::MemOperand(RFASTMEMBASE, armWRegister(addr_wreg), a64::UXTW));
-
-	vtlb_AddLoadStoreInfo((uptr)codeStart, 4, pc, gpr_bitmask, fpr_bitmask,
-		static_cast<u8>(addr_wreg), static_cast<u8>(src_qreg),
-		/*size_in_bits*/ 128, /*is_signed*/ false, /*is_load*/ false, /*is_fpr*/ true);
+	vtlbEmitAccess(addr_wreg, src_qreg, 128, false, false, true,
+		[&](const a64::MemOperand& mem) { armAsm->Str(a64::QRegister(src_qreg), mem); });
 }
 
 // =====================================================================================================
@@ -573,7 +580,7 @@ static void recLoad(u32 bits, bool sign)
 		return;
 	}
 
-	const bool useFastmem = CHECK_FASTMEM && !vtlb_IsFaultingPC(pc);
+	const bool useFastmem = recUseFastPath();
 
 	unsigned addr_reg = 9;
 	if (useFastmem)
@@ -753,7 +760,7 @@ static void recStore(u32 bits)
 	if (recStoreConstPaddrMMIOShortcut(bits))
 		return;
 
-	const bool useFastmem = CHECK_FASTMEM && !vtlb_IsFaultingPC(pc);
+	const bool useFastmem = recUseFastPath();
 
 	if (useFastmem)
 	{
@@ -948,7 +955,7 @@ static void vtlbSoftmemWrite128(int addr_wreg)
 
 void recLQ()
 {
-	const bool useFastmem = CHECK_FASTMEM && !vtlb_IsFaultingPC(pc);
+	const bool useFastmem = recUseFastPath();
 
 	// GE-14 fastmem path: load straight into an allocated NEONTYPE_GPRREG
 	// slot (x86 recLoadQuad's alloc-callback model) — the canonical
@@ -998,7 +1005,7 @@ void recLQ()
 
 void recSQ()
 {
-	const bool useFastmem = CHECK_FASTMEM && !vtlb_IsFaultingPC(pc);
+	const bool useFastmem = recUseFastPath();
 
 	// GE-14 fastmem path: store from the allocator-resident quad (x86
 	// recStore's _allocGPRtoXMMreg(_Rt_, MODE_READ) model). The allocator
@@ -1052,7 +1059,7 @@ void recLWC1()
 	// On the fast path a single inline LDR off RFASTMEMBASE + backpatch,
 	// no iFlushCall and no vtlb C call. Softmem stays as the faulting-PC
 	// fallback.
-	const bool useFastmem = CHECK_FASTMEM && !vtlb_IsFaultingPC(pc);
+	const bool useFastmem = recUseFastPath();
 
 	// Compute address into w9 from live registers.
 	recComputeAddr();
@@ -1109,7 +1116,7 @@ void recSWC1()
 
 	// Inline STR off RFASTMEMBASE + backpatch on the fast path, softmem
 	// fallback otherwise.
-	const bool useFastmem = CHECK_FASTMEM && !vtlb_IsFaultingPC(pc);
+	const bool useFastmem = recUseFastPath();
 
 	// Compute address from live registers.
 	recComputeAddr();
@@ -1179,7 +1186,7 @@ static vixl::aarch64::Register eeUnalignedRtWriteHome()
 // callee-saved temp survives there too.
 static void recUnalignedWord(bool is_lwl)
 {
-	const bool useFastmem = CHECK_FASTMEM && !vtlb_IsFaultingPC(pc);
+	const bool useFastmem = recUseFastPath();
 
 	// Rs+imm into w9. Mirrors recLoad: form the address first, then flush.
 	recComputeAddr();
@@ -1281,7 +1288,7 @@ static void recUnalignedWord(bool is_lwl)
 // collapse to "store Rt" at that alignment.
 static void recUnalignedStoreWord(bool is_swl)
 {
-	const bool useFastmem = CHECK_FASTMEM && !vtlb_IsFaultingPC(pc);
+	const bool useFastmem = recUseFastPath();
 
 	recComputeAddr();
 	iFlushCall(FLUSH_VTLB);
@@ -1416,7 +1423,7 @@ static void recUnalignedLoadDouble(bool is_ldl)
 	}
 	// --- end fusion ----------------------------------------------------------
 
-	const bool useFastmem = CHECK_FASTMEM && !vtlb_IsFaultingPC(pc);
+	const bool useFastmem = recUseFastPath();
 
 	recComputeAddr();
 	iFlushCall(FLUSH_VTLB);
@@ -1556,7 +1563,7 @@ static void recUnalignedStoreDouble(bool is_sdl)
 	}
 	// --- end fusion ----------------------------------------------------------
 
-	const bool useFastmem = CHECK_FASTMEM && !vtlb_IsFaultingPC(pc);
+	const bool useFastmem = recUseFastPath();
 
 	recComputeAddr();
 	iFlushCall(FLUSH_VTLB);
@@ -1653,7 +1660,7 @@ void recLQC2()
 	// save/reload, runtime VPU_STAT check, and cycle accounting.
 	cop2EmitConditionalSync(false, _vu0FinishMicro);
 
-	const bool useFastmem = CHECK_FASTMEM && !vtlb_IsFaultingPC(pc);
+	const bool useFastmem = recUseFastPath();
 
 	// S4-3 fastmem path: no iFlushCall — the allocator (caller-saved scalar
 	// GPRs, FPRC, NEON quads/FPRs) rides through, matching the GE-14 recLQ
@@ -1692,7 +1699,7 @@ void recSQC2()
 	// EEINST-gated VU0 sync — see recLQC2 above.
 	cop2EmitConditionalSync(false, _vu0FinishMicro);
 
-	const bool useFastmem = CHECK_FASTMEM && !vtlb_IsFaultingPC(pc);
+	const bool useFastmem = recUseFastPath();
 
 	// S4-3 fastmem path: no iFlushCall — see recLQC2. The source quad is
 	// read from VU0.VF[ft] memory into RQSCRATCH (q30, never allocator-

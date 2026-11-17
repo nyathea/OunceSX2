@@ -92,6 +92,9 @@ extern void vtlb_ClearLoadStoreInfo();
 extern void vtlb_AddLoadStoreInfo(uptr code_address, u32 code_size, u32 guest_pc, u32 gpr_bitmask, u32 fpr_bitmask, u8 address_register, u8 data_register, u8 size_in_bits, bool is_signed, bool is_load, bool is_fpr);
 extern void vtlb_DynBackpatchLoadStore(uptr code_address, u32 code_size, u32 guest_pc, u32 guest_addr, u32 gpr_bitmask, u32 fpr_bitmask, u8 address_register, u8 data_register, u8 size_in_bits, bool is_signed, bool is_load, bool is_fpr);
 extern bool vtlb_IsFaultingPC(u32 guest_pc);
+// ARM64 no-fastmem path: emits the out-of-line handler call for an inline vtlb
+// lookup that hit a handler page. Saves/restores the live registers in the masks.
+extern void vtlb_EmitOutlinedSlowPath(u32 guest_pc, u32 gpr_bitmask, u32 fpr_bitmask, u8 address_register, u8 data_register, u8 size_in_bits, bool is_signed, bool is_load, bool is_fpr);
 
 //Memory functions
 
@@ -253,6 +256,9 @@ enum vtlb_ProtectionMode
 };
 
 extern vtlb_ProtectionMode mmap_GetRamPageInfo(u32 paddr);
+// False where the host cannot write-protect EE RAM (Switch 2 under kaiHEN):
+// code pages then stay under manual (self-checked) protection.
+extern bool mmap_HostWriteProtectAvailable();
 extern void mmap_MarkCountedRamPage(u32 paddr);
 extern void mmap_ResetBlockTracking();
 

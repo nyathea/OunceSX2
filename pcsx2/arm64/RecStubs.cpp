@@ -368,4 +368,176 @@ void vtlb_DynBackpatchLoadStore(uptr code_address, u32 code_size, u32 guest_pc, 
 	HostSys::FlushInstructionCache(reinterpret_cast<void*>(code_address), 4);
 }
 
+// No-fastmem slow path (Switch 2 and other hosts without a fastmem arena).
+//
+// The JIT emits the vtlb lookup inline (Lsr / Ldr vmap / Adds / B.mi) and the
+// direct host access, with no iFlushCall, exactly like a fastmem site. A
+// handler page (MMIO, unmapped, write-protected code page) takes the B.mi to a
+// cold island whose body is this: save the live allocator registers recorded
+// at emit time, make cpuRegs.pc/code current, call the vtlb dispatcher, land
+// the result, restore. The island machinery appends the branch back.
+//
+// It is the fastmem backpatch thunk's call half, emitted ahead of time instead
+// of on a fault, so register residency survives every load and store and only
+// the rare handler access pays for the spill.
+void vtlb_EmitOutlinedSlowPath(u32 guest_pc, u32 gpr_bitmask, u32 fpr_bitmask, u8 address_register,
+	u8 data_register, u8 size_in_bits, bool is_signed, bool is_load, bool is_fpr)
+{
+	static constexpr u32 MAX_SAVE_GPRS = 19;
+	u8 gprs_to_save[MAX_SAVE_GPRS];
+	u32 num_gprs = 0;
+	for (u32 i = 0; i < 19; i++)
+	{
+		if (!(gpr_bitmask & (1u << i)))
+			continue;
+		// x8 (RWSCRATCH), x16 (VIXL), x17 (RSCRATCHADDR), x18 (platform)
+		if (i == 8 || i >= 16)
+			continue;
+		if (is_load && !is_fpr && i == data_register)
+			continue;
+		gprs_to_save[num_gprs++] = static_cast<u8>(i);
+	}
+
+	static constexpr u32 MAX_SAVE_FPRS = 32;
+	u8 fprs_to_save[MAX_SAVE_FPRS];
+	u32 num_fprs = 0;
+	for (u32 i = 0; i < 32; i++)
+	{
+		if (!(fpr_bitmask & (1u << i)))
+			continue;
+		if (is_load && is_fpr && i == data_register)
+			continue;
+		fprs_to_save[num_fprs++] = static_cast<u8>(i);
+	}
+
+	const u32 stack_size = (num_gprs * 8 + num_fprs * 16 + 15u) & ~15u;
+	if (stack_size > 0)
+		armAsm->Sub(a64::sp, a64::sp, stack_size);
+
+	// Pairs where possible: half the stores on a busy block.
+	u32 offset = 0;
+	u32 i = 0;
+	for (; i + 1 < num_gprs; i += 2, offset += 16)
+		armAsm->Stp(a64::XRegister(gprs_to_save[i]), a64::XRegister(gprs_to_save[i + 1]), a64::MemOperand(a64::sp, offset));
+	for (; i < num_gprs; i++, offset += 8)
+		armAsm->Str(a64::XRegister(gprs_to_save[i]), a64::MemOperand(a64::sp, offset));
+	const u32 fpr_base = offset;
+	for (u32 j = 0; j < num_fprs; j++, offset += 16)
+		armAsm->Str(a64::QRegister(fprs_to_save[j]), a64::MemOperand(a64::sp, offset));
+
+	// A TLB miss or exception raised by the handler reads cpuRegs.pc / code.
+	armAsm->Mov(RWSCRATCH, guest_pc);
+	armAsm->Str(RWSCRATCH, armCpuRegMem(&cpuRegs.pc));
+	armAsm->Mov(RWSCRATCH, *(u32*)PSM(guest_pc));
+	armAsm->Str(RWSCRATCH, armCpuRegMem(&cpuRegs.code));
+
+	// Both clobber only x8 and memory; the address and value registers are
+	// still intact for the argument setup below.
+	armFlushCycleDelta();
+	armFlushEEPinsBeforeVtlbCall();
+
+	const a64::Register waddr = armWRegister(address_register);
+	if (size_in_bits == 128)
+	{
+		pxAssertRel(is_fpr, "128-bit outlined vtlb access must use a q register");
+		if (!is_load && data_register != 0)
+			armAsm->Mov(a64::q0.V16B(), a64::QRegister(data_register).V16B());
+		armAsm->Mov(a64::w0, waddr);
+		armEmitCall(is_load ? (void*)vtlb_memRead128 : (void*)vtlb_memWrite128);
+	}
+	else if (is_load)
+	{
+		armAsm->Mov(a64::w0, waddr);
+		switch (size_in_bits)
+		{
+			case 8:  armEmitCall((void*)vtlb_memRead<mem8_t>);  break;
+			case 16: armEmitCall((void*)vtlb_memRead<mem16_t>); break;
+			case 32: armEmitCall((void*)vtlb_memRead<mem32_t>); break;
+			case 64: armEmitCall((void*)vtlb_memRead<mem64_t>); break;
+			default: pxFailRel("Unsupported outlined load size"); break;
+		}
+	}
+	else
+	{
+		// w0 = address, x1 = value, without one move clobbering the other's source.
+		const a64::Register xdata = armXRegister(data_register);
+		if (data_register == 0 && address_register == 1)
+		{
+			armAsm->Mov(a64::x8, a64::x0);
+			armAsm->Mov(a64::w0, a64::w1);
+			armAsm->Mov(a64::x1, a64::x8);
+		}
+		else if (data_register == 0)
+		{
+			armAsm->Mov(a64::x1, a64::x0);
+			armAsm->Mov(a64::w0, waddr);
+		}
+		else
+		{
+			armAsm->Mov(a64::w0, waddr);
+			if (data_register != 1)
+				armAsm->Mov(a64::x1, xdata);
+		}
+		switch (size_in_bits)
+		{
+			case 8:  armEmitCall((void*)vtlb_memWrite<mem8_t>);  break;
+			case 16: armEmitCall((void*)vtlb_memWrite<mem16_t>); break;
+			case 32: armEmitCall((void*)vtlb_memWrite<mem32_t>); break;
+			case 64: armEmitCall((void*)vtlb_memWrite<mem64_t>); break;
+			default: pxFailRel("Unsupported outlined store size"); break;
+		}
+	}
+
+	armReloadCycleDelta();
+	// A pinned load destination is reloaded here, then overwritten by the Mov below.
+	armReloadEEPinsAfterVtlbCall();
+
+	if (is_load)
+	{
+		if (size_in_bits == 128)
+		{
+			if (data_register != 0)
+				armAsm->Mov(a64::QRegister(data_register).V16B(), a64::q0.V16B());
+		}
+		else if (is_fpr)
+		{
+			armAsm->Fmov(a64::SRegister(data_register), a64::w0);
+		}
+		else
+		{
+			// Same extension as the inline Ldr*: AAPCS64 leaves the upper bits
+			// of a sub-word return unspecified.
+			const a64::Register xd = armXRegister(data_register);
+			switch (size_in_bits)
+			{
+				case 8:  is_signed ? armAsm->Sxtb(xd, a64::w0) : armAsm->Uxtb(xd.W(), a64::w0); break;
+				case 16: is_signed ? armAsm->Sxth(xd, a64::w0) : armAsm->Uxth(xd.W(), a64::w0); break;
+				case 32:
+					if (is_signed)
+						armAsm->Sxtw(xd, a64::w0);
+					else
+						armAsm->Mov(xd.W(), a64::w0); // W write zeroes bits 63:32
+					break;
+				case 64:
+					if (data_register != 0)
+						armAsm->Mov(xd, a64::x0);
+					break;
+			}
+		}
+	}
+
+	offset = 0;
+	i = 0;
+	for (; i + 1 < num_gprs; i += 2, offset += 16)
+		armAsm->Ldp(a64::XRegister(gprs_to_save[i]), a64::XRegister(gprs_to_save[i + 1]), a64::MemOperand(a64::sp, offset));
+	for (; i < num_gprs; i++, offset += 8)
+		armAsm->Ldr(a64::XRegister(gprs_to_save[i]), a64::MemOperand(a64::sp, offset));
+	offset = fpr_base;
+	for (u32 j = 0; j < num_fprs; j++, offset += 16)
+		armAsm->Ldr(a64::QRegister(fprs_to_save[j]), a64::MemOperand(a64::sp, offset));
+
+	if (stack_size > 0)
+		armAsm->Add(a64::sp, a64::sp, stack_size);
+}
+
 // vuJITFreeze() is defined in microVU-arm64.cpp

@@ -588,6 +588,24 @@ extern "C" __attribute__((noreturn)) void __wrap_diagAbortWithResult(Result res)
 	__builtin_unreachable();
 }
 
+// abort() leaves no crash report: VIXL's release-mode checks print to stdout,
+// which is not captured, and then abort, which exits without the atexit
+// handlers. Record the caller so the next exit.txt says where it came from.
+extern "C" void __real_abort(void) __attribute__((noreturn));
+extern "C" __attribute__((noreturn)) void __wrap_abort(void)
+{
+	extern char __start__[];
+	const uptr lr = reinterpret_cast<uptr>(__builtin_return_address(0));
+	const uptr base = reinterpret_cast<uptr>(__start__);
+	char line[128];
+	std::snprintf(line, sizeof(line), "abort() called lr=%p (elf+0x%lx)", reinterpret_cast<void*>(lr),
+		static_cast<unsigned long>(lr >= base ? lr - base : 0));
+	Horizon::ExitTrace(line);
+	fflush(stdout);
+	fflush(stderr);
+	__real_abort();
+}
+
 extern "C" void userAppExit(void)
 {
 	ShutdownAppServices();

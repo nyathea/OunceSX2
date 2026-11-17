@@ -137,6 +137,37 @@ size_t Horizon::ReleaseLeftoverCodeMappings()
 	return leftovers.size() + ram_leftovers.size() + alias_leftovers.size();
 }
 
+bool Horizon::TryWriteProtect(void* addr, size_t size)
+{
+	if (HorizonFastmem::IsArenaAddress(reinterpret_cast<uptr>(addr), size) ||
+		HorizonFastmem::IsCanonicalAddress(reinterpret_cast<uptr>(addr), size))
+	{
+		// Fastmem-managed memory keeps going through MemProtect's alias handling.
+		HostSys::MemProtect(addr, size, PageAccess_ReadOnly());
+		return true;
+	}
+	const Result rc = svcSetMemoryPermission(addr, size, Perm_R);
+	if (R_FAILED(rc))
+	{
+		static bool s_logged = false;
+		if (!s_logged)
+		{
+			s_logged = true;
+			Console.Warning("Horizon: EE RAM cannot be write-protected (svcSetMemoryPermission %p: 0x%08x); "
+							"self-modifying code uses manual block checks",
+				addr, static_cast<u32>(rc));
+		}
+		return false;
+	}
+	static bool s_logged_ok = false;
+	if (!s_logged_ok)
+	{
+		s_logged_ok = true;
+		Console.WriteLn("Horizon: EE RAM write protection works (%p); self-modifying code uses page faults", addr);
+	}
+	return true;
+}
+
 void HostSys::MemProtect(void* baseaddr, size_t size, const PageProtectionMode& mode)
 {
 	pxAssertMsg((size & (__pagesize - 1)) == 0, "Size is page aligned");
