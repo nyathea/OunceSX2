@@ -1,3 +1,5 @@
+![logo](https://github.com/nyathea/OunceSX2/blob/b514f103e64881cea512089f8d4f8218e299e1b7/switch/app/icon.jpg)
+
 # OunceSX2 — Native ARM64 JIT Fork of PCSX2 for Nintendo Switch 2
 
 ARMSX2 is a free and open-source PlayStation 2 (PS2) emulator based on PCSX2. Its purpose is to emulate the PS2's hardware, using a combination of MIPS CPU [Interpreters](<https://en.wikipedia.org/wiki/Interpreter_(computing)>), [Recompilers](https://en.wikipedia.org/wiki/Dynamic_recompilation) and a [Virtual Machine](https://en.wikipedia.org/wiki/Virtual_machine) which manages hardware states and PS2 system memory. This allows you to play PS2 games on your phone, PC, or gaming handheld, with many additional features and benefits.
