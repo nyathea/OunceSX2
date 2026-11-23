@@ -150,13 +150,16 @@ static void vtlbSoftmemWrite(int addr_wreg, int value_reg, u32 bits)
 	}
 
 	armAsm->Lsr(a64::w8, a64::w9, VTLB_PAGE_BITS);
+	// SW2PS2: stores index the write map (vmapW = vmap + VTLB_VMAP_ITEMS), where pages holding
+	// compiled code point at the soft-protection handler.
 	if (CHECK_FASTMEM)
 	{
-		armMoveAddressToReg(RSCRATCHADDR, vtlbdata.vmap);
+		armMoveAddressToReg(RSCRATCHADDR, vtlbdata.vmapW);
 		armAsm->Ldr(a64::x8, a64::MemOperand(RSCRATCHADDR, a64::x8, a64::LSL, 3));
 	}
 	else
 	{
+		armAsm->Add(a64::x8, a64::x8, VTLB_VMAP_ITEMS);
 		armAsm->Ldr(a64::x8, a64::MemOperand(RFASTMEMBASE, a64::x8, a64::LSL, 3));
 	}
 	// ADDS sets N from bit 63 of ppf; B.mi (=N) branches on the sign bit
@@ -912,13 +915,16 @@ static void vtlbSoftmemWrite128(int addr_wreg)
 		armAsm->Mov(a64::w9, armWRegister(addr_wreg));
 
 	armAsm->Lsr(a64::w8, a64::w9, VTLB_PAGE_BITS);
+	// SW2PS2: stores index the write map (vmapW = vmap + VTLB_VMAP_ITEMS), where pages holding
+	// compiled code point at the soft-protection handler.
 	if (CHECK_FASTMEM)
 	{
-		armMoveAddressToReg(RSCRATCHADDR, vtlbdata.vmap);
+		armMoveAddressToReg(RSCRATCHADDR, vtlbdata.vmapW);
 		armAsm->Ldr(a64::x8, a64::MemOperand(RSCRATCHADDR, a64::x8, a64::LSL, 3));
 	}
 	else
 	{
+		armAsm->Add(a64::x8, a64::x8, VTLB_VMAP_ITEMS);
 		armAsm->Ldr(a64::x8, a64::MemOperand(RFASTMEMBASE, a64::x8, a64::LSL, 3));
 	}
 	// ADDS sets N from bit 63 of ppf; B.mi (=N) branches on the sign bit

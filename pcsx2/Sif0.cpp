@@ -41,6 +41,7 @@ static __fi bool WriteFifoToEE()
 	}
 
 	sif0.fifo.read((u32*)ptag, readSize << 2);
+	vtlb_NotifyHostWrite(ptag, readSize << 4); // SW2PS2 soft code protection
 
 	// Clearing handled by vtlb memory protection and manual blocks.
 	//Cpu->Clear(sif0ch.madr, readSize*4);
@@ -120,6 +121,8 @@ static __fi bool ProcessIOPTag()
 {
 	// Process DMA tag at hw_dma9.tadr
 	sif0.iop.data = *(sifData *)iopPhysMem(hw_dma9.tadr);
+	// The EE's side of the tag: its second word is where the data lands in EE memory.
+	const u32 ee_dest = *(u32*)iopPhysMem(hw_dma9.tadr + 12);
 	sif0.iop.data.words = sif0.iop.data.words;
 
 	// send the EE's side of the DMAtag.  The tag is only 64 bits, with the upper 64 bits being the next IOP tag
@@ -135,6 +138,8 @@ static __fi bool ProcessIOPTag()
 	if (sif0words > 0xFFFFF) DevCon.Warning("SIF0 Overrun %x", sif0words);
 	//Maximum transfer amount 1mb-16 also masking out top part which is a "Mode" cache stuff, we don't care :)
 	sif0.iop.counter = sif0words & 0xFFFFF;
+	// The transfer is in IOP memory already: the lag rules look for the end of a call to the memory card server in it.
+	IopThread::NoteSif0FromIop(hw_dma9.madr, sif0.iop.counter, ee_dest);
 
 	// Save the number of words we need to write to make up 1QW from this packet. (See "Junk data writing" in Sif.h)
 	sif0.iop.writeJunk = (sif0.iop.counter & 0x3) ? (4 - sif0.iop.counter & 0x3) : 0;
@@ -292,10 +297,9 @@ static __fi void Sif0End()
 	DMA_LOG("SIF0 DMA End");
 }
 
-// One pass of the IOP side of the pump: first the junk words that fill out the quadword the last
-// packet ended in (written whenever the IOP has nothing left of that packet and the FIFO has room, busy
-// or not), then, if the IOP side is busy and can move, one step of its transfer. Returns whether the
-// transfer step ran; the junk write does not count.
+// IOP side of the pump: write the junk words that pad out the last packet's quadword (whenever the IOP
+// has nothing left of that packet and the FIFO has room, busy or not), then one transfer step if busy
+// and able. Returns whether the transfer step ran; the junk write does not count.
 static __fi bool Sif0IopStep()
 {
 	IOP_SIDE_ASSERT();
@@ -318,8 +322,7 @@ static __fi bool Sif0IopStep()
 	return false;
 }
 
-// One pass of the EE side of the pump: if the EE side is busy and can move, one step of its transfer.
-// Returns whether the step ran.
+// EE side of the pump. Returns whether the transfer step ran.
 static __fi bool Sif0EeStep()
 {
 	EE_SIDE_ASSERT();
@@ -365,6 +368,18 @@ __fi void  EEsif0Interrupt()
 	sif0ch.chcr.STR = false;
 }
 
+// The part of the EE's start that has an effect on the IOP's side of the machine: the EE side is marked busy
+// (an IOP-started pump moves data into the EE only while it is) and the pump runs. It has no effect of its own
+// that anything can see before the pump finishes: the F240 bit it sets is cleared again at the end of SIF0Dma.
+// Run in place with the IOP held, or later, from the IOP's queue, when the IOP thread defers the pump so that
+// the data moves at the IOP's time of the start and not at the EE's.
+__fi void SIF0DmaFromEe()
+{
+	SharedWord::FetchOr(psHu32(SBUS_F240), 0x2000u);
+	sif0.ee.busy = true;
+	SIF0Dma();
+}
+
 __fi void dmaSIF0()
 {
 	SIF_LOG("dmaSIF0 %s", sif0ch.cmqt_to_str().c_str());
@@ -375,8 +390,6 @@ __fi void dmaSIF0()
 	}
 
 	//if(sif0ch.chcr.MOD == CHAIN_MODE && sif0ch.qwc > 0) DevCon.Warning(L"SIF0 QWC on Chain CHCR " + sif0ch.chcr.desc());
-	SharedWord::FetchOr(psHu32(SBUS_F240), 0x2000u);
-	sif0.ee.busy = true;
 
 	// Okay, this here is needed currently (r3644).
 	// FFX battles in the thunder plains map die otherwise, Phantasy Star 4 as well
@@ -390,6 +403,7 @@ __fi void dmaSIF0()
 	// Legend of Legaia doesn't throw a warning either :)
 	sif0.ee.end = false;
 	CPU_SET_DMASTALL(DMAC_SIF0, false);
+	// The F240 busy bit and sif0.ee.busy are set by SIF0DmaFromEe, where the pump starts.
 	IopBridge::Sif0Pump();
 
 }

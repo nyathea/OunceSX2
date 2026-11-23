@@ -67,6 +67,7 @@ static __fi bool WriteFifoToEE()
 	}
 
 	sif2.fifo.read((u32*)ptag, readSize << 2);
+	vtlb_NotifyHostWrite(ptag, readSize << 4); // SW2PS2 soft code protection
 
 	// Clearing handled by vtlb memory protection and manual blocks.
 	//Cpu->Clear(sif2dma.madr, readSize*4);

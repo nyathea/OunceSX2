@@ -40,6 +40,8 @@
 #include "GS/GSVector.h"
 
 #include <algorithm>
+#include <atomic>
+#include <vector>
 #include <bit>
 #include <cstdlib>
 #include <map>
@@ -57,6 +59,14 @@ namespace vtlb_private
 {
 	alignas(64) MapData vtlbdata;
 } // namespace vtlb_private
+
+// SW2PS2 soft code protection (see the block after m_PageProtectInfo).
+static void sw2sp_SetV(u32 vaddr, VTLBVirtual vmv);
+static vtlbHandler s_sw2sp_handler = 0;
+static void sw2sp_RegisterHandler();
+static void sw2sp_ResetAll();
+static void sw2sp_Set(u32 page, bool on);
+static void sw2sp_UnprotectAll();
 
 static vtlbHandler vtlbHandlerCount = 0;
 
@@ -269,7 +279,7 @@ void vtlb_memWrite(u32 addr, DataType data)
 {
 	static const uint DataSize = sizeof(DataType) * 8;
 
-	auto vmv = vtlbdata.vmap[addr >> VTLB_PAGE_BITS];
+	auto vmv = vtlbdata.vmapW[addr >> VTLB_PAGE_BITS];
 
 	if (!vmv.isHandler(addr))
 	{
@@ -308,7 +318,7 @@ void vtlb_memWrite(u32 addr, DataType data)
 
 void TAKES_R128 vtlb_memWrite128(u32 mem, r128 value)
 {
-	auto vmv = vtlbdata.vmap[mem >> VTLB_PAGE_BITS];
+	auto vmv = vtlbdata.vmapW[mem >> VTLB_PAGE_BITS];
 
 	if (!vmv.isHandler(mem))
 	{
@@ -370,6 +380,7 @@ bool vtlb_ramWrite(u32 addr, const DataType& data)
 		return false;
 
 	std::memcpy(reinterpret_cast<DataType*>(vmv.assumePtr(addr)), &data, sizeof(DataType));
+	vtlb_NotifyHostWrite(reinterpret_cast<void*>(vmv.assumePtr(addr)), sizeof(DataType));
 	return true;
 }
 
@@ -444,6 +455,7 @@ bool vtlb_memSafeWriteBytes(u32 mem, const void* src, u32 size)
 		const size_t remaining_in_page =
 			std::min(VTLB_PAGE_SIZE - (mem & VTLB_PAGE_MASK), static_cast<u32>(sptr_end - sptr));
 		std::memcpy(reinterpret_cast<void*>(vmv.assumePtr(mem)), sptr, remaining_in_page);
+		vtlb_NotifyHostWrite(reinterpret_cast<void*>(vmv.assumePtr(mem)), remaining_in_page);
 		sptr += remaining_in_page;
 		mem += remaining_in_page;
 	}
@@ -1227,7 +1239,7 @@ void vtlb_VMap(u32 vaddr, u32 paddr, u32 size)
 		else
 			vmv = VTLBVirtual(vtlbdata.pmap[paddr >> VTLB_PAGE_BITS], paddr, vaddr);
 
-		vtlbdata.vmap[vaddr >> VTLB_PAGE_BITS] = vmv;
+		sw2sp_SetV(vaddr, vmv);
 		if (vtlbdata.ppmap)
 		{
 			if (!(vaddr & 0x80000000)) // those address are already physical don't change them
@@ -1264,7 +1276,7 @@ void vtlb_VMapBuffer(u32 vaddr, void* buffer, u32 size)
 	uptr bu8 = (uptr)buffer;
 	while (size > 0)
 	{
-		vtlbdata.vmap[vaddr >> VTLB_PAGE_BITS] = VTLBVirtual::fromPointer(bu8, vaddr);
+		sw2sp_SetV(vaddr, VTLBVirtual::fromPointer(bu8, vaddr));
 		vaddr += VTLB_PAGE_SIZE;
 		bu8 += VTLB_PAGE_SIZE;
 		size -= VTLB_PAGE_SIZE;
@@ -1280,7 +1292,7 @@ void vtlb_VMapUnmap(u32 vaddr, u32 size)
 
 	while (size > 0)
 	{
-		vtlbdata.vmap[vaddr >> VTLB_PAGE_BITS] = VTLBVirtual(VTLBPhysical::fromHandler(UnmappedVirtHandler), vaddr, vaddr);
+		sw2sp_SetV(vaddr, VTLBVirtual(VTLBPhysical::fromHandler(UnmappedVirtHandler), vaddr, vaddr));
 		vaddr += VTLB_PAGE_SIZE;
 		size -= VTLB_PAGE_SIZE;
 	}
@@ -1307,6 +1319,8 @@ void vtlb_Init()
 	UnmappedVirtHandler = vtlb_RegisterHandler(VTLB_BuildUnmappedHandler(vtlbUnmappedV));
 	UnmappedPhyHandler = vtlb_RegisterHandler(VTLB_BuildUnmappedHandler(vtlbUnmappedP));
 	DefaultPhyHandler = vtlb_RegisterHandler(0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+	sw2sp_RegisterHandler();
+	sw2sp_ResetAll();
 
 	//done !
 
@@ -1386,6 +1400,8 @@ bool vtlb_Core_Alloc()
 	pxAssert(!vtlbdata.vmap && !vtlbdata.fastmem_base && !s_fastmem_area);
 
 	vtlbdata.vmap = reinterpret_cast<VTLBVirtual*>(SysMemory::GetVTLBVirtualMap());
+	vtlbdata.vmapW = reinterpret_cast<VTLBVirtual*>(SysMemory::GetVTLBWriteMap());
+	pxAssertRel(vtlbdata.vmapW == vtlbdata.vmap + VTLB_VMAP_ITEMS, "write map must follow the virtual map");
 
 	pxAssert(!s_fastmem_area);
 	if (!SysMemory::HasCodeMemory())
@@ -1479,6 +1495,7 @@ void vtlb_Alloc_Ppmap()
 void vtlb_Core_Free()
 {
 	vtlbdata.vmap = nullptr;
+	vtlbdata.vmapW = nullptr;
 	vtlbdata.ppmap = nullptr;
 
 	vtlb_RemoveFastmemMappings();
@@ -1587,7 +1604,10 @@ void mmap_MarkCountedRamPage(u32 paddr)
 		paddr >> __pageshift);
 
 	m_PageProtectInfo[rampage].Mode = ProtMode_Write;
-	HostSys::MemProtect(&eeMem->Main[rampage << __pageshift], __pagesize, PageAccess_ReadOnly());
+	if (vtlb_SoftProtActive())
+		sw2sp_Set(static_cast<u32>(rampage), true); // SW2PS2: no host page protection; the write map catches writes
+	else
+		HostSys::MemProtect(&eeMem->Main[rampage << __pageshift], __pagesize, PageAccess_ReadOnly());
 	// Narrowing is safe, the bound above keeps this under ExposedRam.
 	vtlb_UpdateFastmemProtection(static_cast<u32>(rampage << __pageshift), __pagesize, PageAccess_ReadOnly());
 }
@@ -1606,10 +1626,210 @@ static __fi void mmap_ClearCpuBlock(uint offset)
 	pxAssertMsg(m_PageProtectInfo[rampage].Mode != ProtMode_Manual,
 		"Attempted to clear a block that is already under manual protection.");
 
-	HostSys::MemProtect(&eeMem->Main[rampage << __pageshift], __pagesize, PageAccess_ReadWrite());
+	sw2sp_Set(static_cast<u32>(rampage), false);
+	if (!vtlb_SoftProtActive())
+		HostSys::MemProtect(&eeMem->Main[rampage << __pageshift], __pagesize, PageAccess_ReadWrite());
 	vtlb_UpdateFastmemProtection(rampage << __pageshift, __pagesize, PageAccess_ReadWrite());
 	m_PageProtectInfo[rampage].Mode = ProtMode_Manual;
 	Cpu->Clear(m_PageProtectInfo[rampage].ReverseRamMap, __pagesize);
+}
+
+
+// ---------------------------------------------------------------------------------------------
+//  SW2PS2 soft code protection
+// ---------------------------------------------------------------------------------------------
+// The Switch 2 under kaiHEN gives homebrew neither page protection on RAM nor fault delivery, so
+// the stock scheme (write-protect pages holding compiled code, clear them on the fault) cannot run
+// and every block used to compare its own code at entry. Instead, writes are caught in software:
+//  - vtlbdata.vmapW is a copy of vmap used for every write (JIT stores and vtlb_memWrite*). For a
+//    RAM page in ProtMode_Write its entries point at s_sw2sp_handler, whose write functions clear
+//    the page's blocks (mmap_ClearCpuBlock, as the fault handler would) and then do the write.
+//    Unprotected pages cost nothing extra: the JIT only indexes a different table.
+//  - DMA and other C paths that write eeMem->Main directly call vtlb_NotifyRamWrite. Writes from
+//    another thread (the IOP thread pumping SIF0) are queued and cleared by the EE thread at its
+//    next event test, before it can take the DMA's completion interrupt.
+// s_sw2sp_rev keeps, per RAM page, the virtual pages that mapped it, so protecting a page can
+// update every alias (kseg0/1, the uncached mirrors, TLB mappings). Stale entries are dropped lazily.
+
+static constexpr u32 SW2SP_PAGES = Ps2MemSize::TotalRam >> __pageshift;
+static bool s_sw2sp_on[SW2SP_PAGES];
+static std::vector<u32> s_sw2sp_rev[SW2SP_PAGES];
+static u32 s_sw2sp_count = 0;
+static std::atomic<u64> s_sw2sp_pending[SW2SP_PAGES / 64];
+static std::atomic<bool> s_sw2sp_any_pending{false};
+
+bool vtlb_SoftProtActive()
+{
+#ifdef __SWITCH__
+	return !CHECK_FASTMEM && !HorizonFastmem::IsSmcProtectionActive();
+#else
+	return false;
+#endif
+}
+
+static inline s32 sw2sp_PageOf(u32 vaddr, VTLBVirtual vmv)
+{
+	if (!eeMem || vmv.isHandler(vaddr))
+		return -1;
+	const uptr ptr = vmv.assumePtr(vaddr);
+	const uptr base = reinterpret_cast<uptr>(eeMem->Main);
+	if (ptr < base || ptr - base >= Ps2MemSize::ExposedRam)
+		return -1;
+	return static_cast<s32>((ptr - base) >> __pageshift);
+}
+
+static inline VTLBVirtual sw2sp_Entry(u32 page, u32 vaddr)
+{
+	return VTLBVirtual(VTLBPhysical::fromHandler(s_sw2sp_handler), page << __pageshift, vaddr);
+}
+
+static void sw2sp_SetV(u32 vaddr, VTLBVirtual vmv)
+{
+	const u32 i = vaddr >> VTLB_PAGE_BITS;
+	vtlbdata.vmap[i] = vmv;
+	if (!vtlbdata.vmapW)
+		return;
+	vtlbdata.vmapW[i] = vmv;
+	const s32 p = sw2sp_PageOf(vaddr, vmv);
+	if (p < 0)
+		return;
+	std::vector<u32>& rev = s_sw2sp_rev[p];
+	if (std::find(rev.begin(), rev.end(), i) == rev.end())
+		rev.push_back(i);
+	if (s_sw2sp_on[p])
+		vtlbdata.vmapW[i] = sw2sp_Entry(static_cast<u32>(p), vaddr);
+}
+
+static void sw2sp_Set(u32 page, bool on)
+{
+	if (page >= SW2SP_PAGES || s_sw2sp_on[page] == on || !vtlbdata.vmapW)
+		return;
+	s_sw2sp_on[page] = on;
+	if (on) s_sw2sp_count++; else s_sw2sp_count--;
+	std::vector<u32>& rev = s_sw2sp_rev[page];
+	for (size_t k = 0; k < rev.size();)
+	{
+		const u32 i = rev[k];
+		const u32 vaddr = i << VTLB_PAGE_BITS;
+		const VTLBVirtual vmv = vtlbdata.vmap[i];
+		if (sw2sp_PageOf(vaddr, vmv) != static_cast<s32>(page))
+		{
+			rev[k] = rev.back();
+			rev.pop_back();
+			continue;
+		}
+		vtlbdata.vmapW[i] = on ? sw2sp_Entry(page, vaddr) : vmv;
+		k++;
+	}
+}
+
+static void sw2sp_UnprotectAll()
+{
+	if (!s_sw2sp_count)
+		return;
+	for (u32 p = 0; p < SW2SP_PAGES; p++)
+		if (s_sw2sp_on[p])
+			sw2sp_Set(p, false);
+}
+
+static void sw2sp_ResetAll()
+{
+	std::memset(s_sw2sp_on, 0, sizeof(s_sw2sp_on));
+	s_sw2sp_count = 0;
+	for (std::vector<u32>& rev : s_sw2sp_rev)
+		rev.clear();
+	for (std::atomic<u64>& w : s_sw2sp_pending)
+		w.store(0, std::memory_order_relaxed);
+	s_sw2sp_any_pending.store(false, std::memory_order_relaxed);
+}
+
+// A write reached a protected page (EE thread only).
+static void sw2sp_Hit(u32 off)
+{
+	const u32 page = off >> __pageshift;
+	if (!s_sw2sp_on[page])
+		return;
+	if (m_PageProtectInfo[page].Mode == ProtMode_Write)
+		mmap_ClearCpuBlock(off & ~__pagemask); // clears the blocks and drops the protection
+	else
+		sw2sp_Set(page, false);
+}
+
+template <typename T>
+static T sw2spRead(u32 off)
+{
+	T v;
+	std::memcpy(&v, &eeMem->Main[off], sizeof(T));
+	return v;
+}
+static RETURNS_R128 sw2spRead128(u32 off) { return r128_load(&eeMem->Main[off & ~15u]); }
+
+template <typename T>
+static void sw2spWrite(u32 off, T data)
+{
+	sw2sp_Hit(off);
+	std::memcpy(&eeMem->Main[off], &data, sizeof(T));
+}
+static void TAKES_R128 sw2spWrite128(u32 off, r128 data)
+{
+	sw2sp_Hit(off);
+	r128_store_unaligned(&eeMem->Main[off], data);
+}
+
+static void sw2sp_RegisterHandler()
+{
+	s_sw2sp_handler = vtlb_RegisterHandler(sw2spRead<mem8_t>, sw2spRead<mem16_t>, sw2spRead<mem32_t>, sw2spRead<mem64_t>, sw2spRead128,
+		sw2spWrite<mem8_t>, sw2spWrite<mem16_t>, sw2spWrite<mem32_t>, sw2spWrite<mem64_t>, sw2spWrite128);
+}
+
+void vtlb_NotifyRamWrite(u32 off, u32 size)
+{
+	if (!s_sw2sp_count || !size || off >= Ps2MemSize::ExposedRam)
+		return;
+	const u32 end = std::min<u32>(off + size, Ps2MemSize::ExposedRam);
+	const bool ee = VMManager::Internal::IsOnCPUThread();
+	for (u32 p = off >> __pageshift; p <= ((end - 1) >> __pageshift); p++)
+	{
+		if (!s_sw2sp_on[p])
+			continue;
+		if (ee)
+		{
+			sw2sp_Hit(p << __pageshift);
+		}
+		else
+		{
+			s_sw2sp_pending[p / 64].fetch_or(1ULL << (p % 64), std::memory_order_release);
+			s_sw2sp_any_pending.store(true, std::memory_order_release);
+		}
+	}
+}
+
+void vtlb_NotifyHostWrite(const void* host, size_t size)
+{
+	if (!eeMem || !s_sw2sp_count)
+		return;
+	const uptr h = reinterpret_cast<uptr>(host);
+	const uptr base = reinterpret_cast<uptr>(eeMem->Main);
+	if (h < base || h - base >= Ps2MemSize::ExposedRam)
+		return;
+	vtlb_NotifyRamWrite(static_cast<u32>(h - base), static_cast<u32>(size));
+}
+
+void vtlb_ProcessPendingRamWrites()
+{
+	if (!s_sw2sp_any_pending.load(std::memory_order_acquire))
+		return;
+	s_sw2sp_any_pending.store(false, std::memory_order_relaxed);
+	for (u32 w = 0; w < SW2SP_PAGES / 64; w++)
+	{
+		u64 bits = s_sw2sp_pending[w].exchange(0, std::memory_order_acq_rel);
+		while (bits)
+		{
+			const u32 p = w * 64 + static_cast<u32>(std::countr_zero(bits));
+			bits &= bits - 1;
+			sw2sp_Hit(p << __pageshift);
+		}
+	}
 }
 
 PageFaultHandler::HandlerResult PageFaultHandler::HandlePageFault(void* exception_pc, void* fault_address, bool is_write)
@@ -1666,6 +1886,7 @@ void mmap_ResetBlockTracking()
 {
 	//DbgCon.WriteLn( "vtlb/mmap: Block Tracking reset..." );
 	std::memset(m_PageProtectInfo, 0, sizeof(m_PageProtectInfo));
+	sw2sp_UnprotectAll();
 	if (eeMem)
 		HostSys::MemProtect(eeMem->Main, Ps2MemSize::ExposedRam, PageAccess_ReadWrite());
 	vtlb_UpdateFastmemProtection(0, Ps2MemSize::ExposedRam, PageAccess_ReadWrite());

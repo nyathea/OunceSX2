@@ -67,6 +67,15 @@ static __fi bool WriteFifoToIOP()
 	sif1.iop.cycles += readSize >> 2;		// fixme: should be >> 4
 	sif1.iop.counter -= readSize;
 
+	// The whole transfer is in IOP memory: the lag rules look for a call to the memory card server in it. Where it started comes
+	// from the tag's length and the address the DMA has reached, both in the savestate, so a state saved part way through a
+	// transfer still finds it.
+	if (sif1.iop.counter <= 0)
+	{
+		const u32 words = sif1words & 0xFFFFC;
+		IopThread::NoteSif1ToIop(hw_dma10.madr - words * 4, words);
+	}
+
 	return true;
 }
 
@@ -262,9 +271,9 @@ static __fi void Sif1End()
 	DMA_LOG("SIF1 DMA End");
 }
 
-// One pass of the EE side of the pump: if the EE side is busy, not held by the DMAC's stall control,
-// and can move, one step of its transfer. Returns whether the step ran. The step itself can set the
-// stall flag, which holds the EE side for the rest of this call and the calls after it.
+// One step of the EE side's transfer, if it is busy, not held by the DMAC's stall control, and can move.
+// Returns whether a step ran. The step can set the stall flag, which holds the EE side for the rest of this
+// call and the calls after it.
 static __fi bool Sif1EeStep()
 {
 	EE_SIDE_ASSERT();
@@ -280,8 +289,7 @@ static __fi bool Sif1EeStep()
 	return false;
 }
 
-// One pass of the IOP side of the pump: if the IOP side is busy and can move, one step of its
-// transfer. Returns whether the step ran.
+// One step of the IOP side's transfer, if it is busy and can move. Returns whether a step ran.
 static __fi bool Sif1IopStep()
 {
 	IOP_SIDE_ASSERT();
@@ -336,6 +344,17 @@ __fi void  EEsif1Interrupt()
 	sif1ch.chcr.STR = false;
 }
 
+// The part of the EE's start that has an effect on the IOP's side of the machine: the EE side is marked busy
+// (an IOP-started pump moves the EE's data into IOP RAM only while it is) and the pump runs. See SIF0DmaFromEe.
+// The F240 bit is cleared again at the end of SIF1Dma, except when SIF1Dma returns early because the DMAC's
+// stall control still holds the transfer; that is the case before and after this function existed.
+__fi void SIF1DmaFromEe()
+{
+	SharedWord::FetchOr(psHu32(SBUS_F240), 0x4000u);
+	sif1.ee.busy = true;
+	SIF1Dma();
+}
+
 // Do almost exactly the same thing as psxDma10 in IopDma.cpp.
 // Main difference is this checks for iop, where psxDma10 checks for ee.
 __fi void dmaSIF1()
@@ -346,9 +365,6 @@ __fi void dmaSIF1()
 	{
 		SIF_LOG("warning, sif1.fifoReadPos != sif1.fifoWritePos");
 	}
-
-	SharedWord::FetchOr(psHu32(SBUS_F240), 0x4000u);
-	sif1.ee.busy = true;
 
 	CPU_SET_DMASTALL(DMAC_SIF1, false);
 	// Okay, this here is needed currently (r3644).
@@ -371,6 +387,7 @@ __fi void dmaSIF1()
 		}
 	}
 
+	// The F240 busy bit and sif1.ee.busy are set by SIF1DmaFromEe, where the pump starts.
 	IopBridge::Sif1Pump();
 
 }

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
 // SPDX-License-Identifier: GPL-3.0+
 
+#include "IopThread/IopThreadMode.h"
 #include "Common.h"
 #include "R5900OpcodeTables.h"
 #include "VMManager.h"
@@ -324,6 +325,7 @@ static __fi void _doBranch_shared(u32 tar)
 						cpuRegs.cycle = cpuRegs.nextEventCycle;
 					else
 						cpuRegs.nextEventCycle = cpuRegs.cycle;
+					eeFastForwardKind |= IopThread::FastForward::Interpreter;  // (ported from ARMSX2)
 				}
 			}
 		}

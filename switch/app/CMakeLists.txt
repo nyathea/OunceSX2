@@ -4,7 +4,7 @@
 
 enable_language(ASM)
 
-add_executable(yadokari
+add_executable(OunceSX2
 	main.cpp
 	HorizonHost.cpp
 	HorizonUsbStorage.cpp
@@ -19,50 +19,50 @@ set_source_files_properties(HorizonException.cpp HorizonExceptionEntry.S
 # USB mass-storage support
 include("${CMAKE_CURRENT_SOURCE_DIR}/../cmake/UsbHsFs.cmake")
 
-target_include_directories(yadokari PRIVATE
+target_include_directories(OunceSX2 PRIVATE
 	"${CMAKE_BINARY_DIR}/common/include"
 	"${CMAKE_SOURCE_DIR}"
 	"${CMAKE_SOURCE_DIR}/pcsx2"
 )
 
-set(YADOKARI_NRO_VERSION "${ARMSX2_VERSION}")
-if(NOT YADOKARI_NRO_VERSION)
-	set(YADOKARI_NRO_VERSION "1.0.0")
+set(OUNCESX2_NRO_VERSION "${ARMSX2_VERSION}")
+if(NOT OUNCESX2_NRO_VERSION)
+	set(OUNCESX2_NRO_VERSION "1.1")
 endif()
 
-set(YADOKARI_CORE_LINK_TARGETS PCSX2)
+set(OUNCESX2_CORE_LINK_TARGETS PCSX2)
 if(TARGET PCSX2_LTO)
-	list(APPEND YADOKARI_CORE_LINK_TARGETS PCSX2_LTO)
+	list(APPEND OUNCESX2_CORE_LINK_TARGETS PCSX2_LTO)
 endif()
 
-target_link_libraries(yadokari PRIVATE
+target_link_libraries(OunceSX2 PRIVATE
 	-Wl,--start-group
-	${YADOKARI_CORE_LINK_TARGETS}
+	${OUNCESX2_CORE_LINK_TARGETS}
 	PCSX2_FLAGS
 	-Wl,--end-group
 	usbhsfs
 )
 
 if(NINTENDO_SWITCH2)
-	target_link_libraries(yadokari PRIVATE kaihen)
+	target_link_libraries(OunceSX2 PRIVATE kaihen)
 else()
-	target_link_libraries(yadokari PRIVATE deko3d)
+	target_link_libraries(OunceSX2 PRIVATE deko3d)
 endif()
 
-target_link_options(yadokari PRIVATE -Wl,--wrap=pthread_create -Wl,--wrap=pthread_join)
+target_link_options(OunceSX2 PRIVATE -Wl,--wrap=pthread_create -Wl,--wrap=pthread_join)
 if(NINTENDO_SWITCH2)
-	target_sources(yadokari PRIVATE ServiceLookupGuard.cpp)
-	target_link_options(yadokari PRIVATE -Wl,--wrap=diagAbortWithResult -Wl,--wrap=smGetServiceWrapper -Wl,--wrap=smGetServiceOriginal)
+	target_sources(OunceSX2 PRIVATE ServiceLookupGuard.cpp)
+	target_link_options(OunceSX2 PRIVATE -Wl,--wrap=diagAbortWithResult -Wl,--wrap=smGetServiceWrapper -Wl,--wrap=smGetServiceOriginal)
 endif()
 
 if(USE_VULKAN OR USE_OPENGL)
 	find_package(PkgConfig REQUIRED)
 	if(NINTENDO_SWITCH2)
 		pkg_check_modules(OUNCEVK REQUIRED vulkan)
-		target_sources(yadokari PRIVATE nvk_compat.cpp)
-		target_include_directories(yadokari PRIVATE ${OUNCEVK_INCLUDE_DIRS})
-		target_compile_options(yadokari PRIVATE ${OUNCEVK_CFLAGS_OTHER})
-		target_link_libraries(yadokari PRIVATE ${OUNCEVK_LDFLAGS})
+		target_sources(OunceSX2 PRIVATE nvk_compat.cpp)
+		target_include_directories(OunceSX2 PRIVATE ${OUNCEVK_INCLUDE_DIRS})
+		target_compile_options(OunceSX2 PRIVATE ${OUNCEVK_CFLAGS_OTHER})
+		target_link_libraries(OunceSX2 PRIVATE ${OUNCEVK_LDFLAGS})
 	else()
 		if(USE_OPENGL)
 			pkg_check_modules(NXVK REQUIRED nxvk-gl)
@@ -71,11 +71,11 @@ if(USE_VULKAN OR USE_OPENGL)
 		endif()
 
 		# newlib shims required by NXVK.
-		target_sources(yadokari PRIVATE nvk_compat.cpp)
-		target_include_directories(yadokari PRIVATE ${NXVK_INCLUDE_DIRS})
-		target_compile_options(yadokari PRIVATE ${NXVK_CFLAGS_OTHER})
+		target_sources(OunceSX2 PRIVATE nvk_compat.cpp)
+		target_include_directories(OunceSX2 PRIVATE ${NXVK_INCLUDE_DIRS})
+		target_compile_options(OunceSX2 PRIVATE ${NXVK_CFLAGS_OTHER})
 
-		target_link_libraries(yadokari PRIVATE ${NXVK_LDFLAGS})
+		target_link_libraries(OunceSX2 PRIVATE ${NXVK_LDFLAGS})
 	endif()
 endif()
 
@@ -185,28 +185,28 @@ add_custom_command(
 )
 list(APPEND DK3D_DKSH_FILES "${DK3D_ROMFS_SHADER_DIR}/cas_csh.dksh")
 
-add_custom_target(yadokari_shaders DEPENDS ${DK3D_DKSH_FILES})
-add_dependencies(yadokari yadokari_shaders)
+add_custom_target(OunceSX2_shaders DEPENDS ${DK3D_DKSH_FILES})
+add_dependencies(OunceSX2 OunceSX2_shaders)
 endif()
 
 # Embed resources into the romfs
-set(YADOKARI_RESOURCE_SRC_DIR "${CMAKE_SOURCE_DIR}/bin/resources")
+set(OUNCESX2_RESOURCE_SRC_DIR "${CMAKE_SOURCE_DIR}/bin/resources")
 set(DK3D_ROMFS_RESOURCE_DIR "${DK3D_ROMFS_DIR}/resources")
-set(YADOKARI_RESOURCE_STAMP "${CMAKE_CURRENT_BINARY_DIR}/yadokari_resources.stamp")
-file(GLOB_RECURSE YADOKARI_RESOURCE_FILES CONFIGURE_DEPENDS "${YADOKARI_RESOURCE_SRC_DIR}/*")
+set(OUNCESX2_RESOURCE_STAMP "${CMAKE_CURRENT_BINARY_DIR}/OunceSX2_resources.stamp")
+file(GLOB_RECURSE OUNCESX2_RESOURCE_FILES CONFIGURE_DEPENDS "${OUNCESX2_RESOURCE_SRC_DIR}/*")
 
-set(YADOKARI_PATCHES_ZIP "" CACHE FILEPATH "A patches.zip to pack instead of downloading one")
-set(YADOKARI_PATCHES_ZIP_URL
+set(OUNCESX2_PATCHES_ZIP "" CACHE FILEPATH "A patches.zip to pack instead of downloading one")
+set(OUNCESX2_PATCHES_ZIP_URL
 	"https://github.com/isztldav/pcsx2_patches/releases/latest/download/patches.zip"
 	CACHE STRING "Where to fetch patches.zip when none is given")
-set(YADOKARI_PATCHES_COPY_COMMAND "")
-if(YADOKARI_PATCHES_ZIP AND EXISTS "${YADOKARI_PATCHES_ZIP}")
-	set(_patches_zip "${YADOKARI_PATCHES_ZIP}")
+set(OUNCESX2_PATCHES_COPY_COMMAND "")
+if(OUNCESX2_PATCHES_ZIP AND EXISTS "${OUNCESX2_PATCHES_ZIP}")
+	set(_patches_zip "${OUNCESX2_PATCHES_ZIP}")
 else()
 	set(_patches_zip "${CMAKE_CURRENT_BINARY_DIR}/patches.zip")
 	if(NOT EXISTS "${_patches_zip}")
-		message(STATUS "Fetching patches.zip from ${YADOKARI_PATCHES_ZIP_URL}")
-		file(DOWNLOAD "${YADOKARI_PATCHES_ZIP_URL}" "${_patches_zip}" STATUS _patches_status TIMEOUT 120)
+		message(STATUS "Fetching patches.zip from ${OUNCESX2_PATCHES_ZIP_URL}")
+		file(DOWNLOAD "${OUNCESX2_PATCHES_ZIP_URL}" "${_patches_zip}" STATUS _patches_status TIMEOUT 120)
 		list(GET _patches_status 0 _patches_result)
 		if(NOT _patches_result EQUAL 0)
 			list(GET _patches_status 1 _patches_error)
@@ -218,38 +218,38 @@ else()
 	endif()
 endif()
 if(DEFINED _patches_zip)
-	list(APPEND YADOKARI_RESOURCE_FILES "${_patches_zip}")
-	set(YADOKARI_PATCHES_COPY_COMMAND
+	list(APPEND OUNCESX2_RESOURCE_FILES "${_patches_zip}")
+	set(OUNCESX2_PATCHES_COPY_COMMAND
 		COMMAND ${CMAKE_COMMAND} -E copy "${_patches_zip}" "${DK3D_ROMFS_RESOURCE_DIR}/patches.zip")
 endif()
 
 add_custom_command(
-	OUTPUT "${YADOKARI_RESOURCE_STAMP}"
-	COMMAND ${CMAKE_COMMAND} -E copy_directory "${YADOKARI_RESOURCE_SRC_DIR}" "${DK3D_ROMFS_RESOURCE_DIR}"
-	${YADOKARI_PATCHES_COPY_COMMAND}
-	COMMAND ${CMAKE_COMMAND} -E touch "${YADOKARI_RESOURCE_STAMP}"
-	DEPENDS ${YADOKARI_RESOURCE_FILES}
+	OUTPUT "${OUNCESX2_RESOURCE_STAMP}"
+	COMMAND ${CMAKE_COMMAND} -E copy_directory "${OUNCESX2_RESOURCE_SRC_DIR}" "${DK3D_ROMFS_RESOURCE_DIR}"
+	${OUNCESX2_PATCHES_COPY_COMMAND}
+	COMMAND ${CMAKE_COMMAND} -E touch "${OUNCESX2_RESOURCE_STAMP}"
+	DEPENDS ${OUNCESX2_RESOURCE_FILES}
 	COMMENT "Copying resources into ROMFS (romfs:/resources)"
 	VERBATIM
 )
-add_custom_target(yadokari_resources DEPENDS "${YADOKARI_RESOURCE_STAMP}")
+add_custom_target(OunceSX2_resources DEPENDS "${OUNCESX2_RESOURCE_STAMP}")
 
 # Pack the compiled shaders and resources into the NRO's ROMFS.
-dkp_add_asset_target(yadokari_romfs "${DK3D_ROMFS_DIR}")
-add_dependencies(yadokari_romfs yadokari_resources)
-if(TARGET yadokari_shaders)
-	add_dependencies(yadokari_romfs yadokari_shaders)
+dkp_add_asset_target(OunceSX2_romfs "${DK3D_ROMFS_DIR}")
+add_dependencies(OunceSX2_romfs OunceSX2_resources)
+if(TARGET OunceSX2_shaders)
+	add_dependencies(OunceSX2_romfs OunceSX2_shaders)
 endif()
-set_property(TARGET yadokari_romfs APPEND PROPERTY DKP_ASSET_FILES ${DK3D_DKSH_FILES} "${YADOKARI_RESOURCE_STAMP}")
+set_property(TARGET OunceSX2_romfs APPEND PROPERTY DKP_ASSET_FILES ${DK3D_DKSH_FILES} "${OUNCESX2_RESOURCE_STAMP}")
 
-nx_generate_nacp(OUTPUT yadokari.nacp
+nx_generate_nacp(OUTPUT OunceSX2.nacp
 	NAME "OunceSX2"
-	AUTHOR "ARMSX2 Team, PalindromicBreadLoaf & nyathea"
-	VERSION "${YADOKARI_NRO_VERSION}"
+	AUTHOR "ARMSX2 Team, PalindromicBreadLoaf, & nyathea"
+	VERSION "${OUNCESX2_NRO_VERSION}"
 )
-nx_create_nro(yadokari
-	OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/yadokari.nro"
-	NACP "${CMAKE_CURRENT_BINARY_DIR}/yadokari.nacp"
+nx_create_nro(OunceSX2
+	OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/OunceSX2.nro"
+	NACP "${CMAKE_CURRENT_BINARY_DIR}/OunceSX2.nacp"
 	ICON "${CMAKE_CURRENT_SOURCE_DIR}/icon.jpg"
-	ROMFS yadokari_romfs
+	ROMFS OunceSX2_romfs
 )

@@ -151,7 +151,9 @@ static void MonitoredWait(const std::atomic<s32>& word, s32 expected)
 
 u32 ShortSpinOn(const std::atomic<s32>& word, s32 expected)
 {
-#if defined(ARCH_ARM64) && !defined(_MSC_VER)
+	// SW2PS2: no monitored WFE wait on the Switch 2, whose kernel gives no event stream (see MonitoredWait:
+	// "a monitor that never fires is a latency cost, not a hang" holds only with one); the spin path instead.
+#if defined(ARCH_ARM64) && !defined(_MSC_VER) && !defined(__SWITCH__)
 	const u64 start = GetCPUTicks();
 	MonitoredWait(word, expected);
 	// Charge unmeasurably short waits as one tick, not zero: the caller

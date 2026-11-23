@@ -1438,7 +1438,10 @@ struct Pcsx2Config
 			// Let the governor lower the EE cycle rate below EECycleRate, by up to two
 			// steps, when the host cannot hold the frame deadline. Never above it, and
 			// never written back — EECycleRate stays the player's baseline.
-			DynamicEECycleRate : 1;
+			DynamicEECycleRate : 1,
+			// (Ported from ARMSX2.) With iopThread: EE-started SIF0/SIF1 DMA does not hold the IOP (IopThread::DeferSifPump).
+			// INI only, experimental. After DynamicEECycleRate so that no existing bit moves.
+			iopThreadDeferSif : 1;
 		BITFIELD_END
 
 		s8 EECycleRate; // EE cycle rate selector (1.0, 1.5, 2.0)

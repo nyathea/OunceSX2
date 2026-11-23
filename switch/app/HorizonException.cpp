@@ -167,7 +167,7 @@ extern "C" __attribute__((noreturn)) void __horizon_unhandled_exception(ThreadEx
 	bool opened_temp = false;
 	if (fd < 0)
 	{
-		fd = open("sdmc:/switch/yadokari/logs/crash.txt", O_WRONLY | O_CREAT | O_APPEND, 0666);
+		fd = open("sdmc:/switch/OunceSX2/logs/crash.txt", O_WRONLY | O_CREAT | O_APPEND, 0666);
 		opened_temp = (fd >= 0);
 	}
 	if (fd >= 0)

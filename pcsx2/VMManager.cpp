@@ -5098,6 +5098,8 @@ u64 VMManager::Internal::GetPerformanceCoreMask()
 {
 #if defined(__linux__)
 	return GetPerformanceCoresMask();
+#elif defined(__SWITCH__)
+	return Horizon::GetProcessCoreMask(); // SW2PS2: the Switch 2's cores are all the same (Cortex-A78C)
 #else
 	return 0; // no capacity source: the cores cannot be told apart, so Threaded is not offered
 #endif

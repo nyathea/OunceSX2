@@ -86,6 +86,7 @@ static void memcpy_to_spr(u32 dst, u8* src, size_t size)
 
 static void memcpy_from_spr(u8* dst, u32 src, size_t size)
 {
+	u8* const dst0 = dst;
 	src &= _16kb - 1;
 
 	if (src + size >= _16kb) {
@@ -97,6 +98,7 @@ static void memcpy_from_spr(u8* dst, u32 src, size_t size)
 	} else {
 		memcpy(dst, &psSu128(src), size);
 	}
+	vtlb_NotifyHostWrite(dst0, size); // SW2PS2 soft code protection
 }
 
 int  _SPR0chain()

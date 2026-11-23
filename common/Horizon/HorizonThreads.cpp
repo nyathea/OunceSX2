@@ -106,18 +106,18 @@ namespace
 {
 	std::mutex s_clk_mutex;
 	ClkrstSession s_clk_cpu{};
-	ClkrstSession s_clk_gpu{};
-	bool s_clk_ready = false;
-	bool s_clk_gpu_ready = false;
-	u32 s_clk_cpu_start = 0;
-	u32 s_clk_cpu_set = 0;
-	u32 s_clk_cpu_max = 0;
+	bool s_clk_ready = false;      // clkrst session open and rates known
+	bool s_applet_boost = false;   // clkrst unavailable: boost requested through the applet instead
+	bool s_boost_wanted = Horizon::DefaultCpuBoost;
+	bool s_boosted = false;
+	u32 s_clk_cpu_max = 0;         // highest CPU rate offered
+	u32 s_clk_cpu_baseline = 0;    // the system's own rate, restored when the boost is turned off
 
-	bool EnsureClockSessionLocked()
+	constexpr u32 MHz(u32 hz) { return hz / 1000000; }
+	constexpr u32 MHzTenth(u32 hz) { return (hz / 100000) % 10; }
+
+	bool OpenClockSessionLocked()
 	{
-		if (s_clk_ready)
-			return true;
-
 		Result rc = clkrstInitialize();
 		if (R_FAILED(rc))
 		{
@@ -133,86 +133,104 @@ namespace
 			return false;
 		}
 
-		s_clk_gpu_ready = R_SUCCEEDED(clkrstOpenSession(&s_clk_gpu, PcvModuleId_GPU, 3));
-		s_clk_ready = true;
+		u32 rates[32] = {};
+		PcvClockRatesListType type = PcvClockRatesListType_Invalid;
+		s32 count = 0;
+		u32 now = 0;
+		const Result rc_now = clkrstGetClockRate(&s_clk_cpu, &now);
+		const Result rc_rates = clkrstGetPossibleClockRates(&s_clk_cpu, rates, 32, &type, &count);
+		if (R_FAILED(rc_now) || R_FAILED(rc_rates) || count <= 0)
+		{
+			Console.Warning("Switch: failed to query CPU clock rates (now=0x%08x, rates=0x%08x, count=%d)",
+				rc_now, rc_rates, count);
+			clkrstCloseSession(&s_clk_cpu);
+			clkrstExit();
+			return false;
+		}
+
+		s_clk_cpu_max = (type == PcvClockRatesListType_Range && count >= 2) ?
+		                    rates[1] :
+		                    *std::max_element(rates, rates + std::min<s32>(count, 32));
+		s_clk_cpu_baseline = now;
+		Console.WriteLn("Switch: CPU clock at %u.%01u MHz (max %u.%01u MHz)",
+			MHz(now), MHzTenth(now), MHz(s_clk_cpu_max), MHzTenth(s_clk_cpu_max));
 		return true;
+	}
+
+	void ApplyBoostLocked(bool boost)
+	{
+		if (!s_clk_ready)
+		{
+			// No clkrst: the applet's CPU boost is the only lever.
+			if (boost && !s_applet_boost)
+			{
+				const Result rc = appletSetCpuBoostMode(ApmCpuBoostMode_FastLoad);
+				Console.WriteLn("Switch: clkrst unavailable, requested appletSetCpuBoostMode(FastLoad) (rc=0x%08x)", rc);
+				s_applet_boost = R_SUCCEEDED(rc);
+			}
+			else if (!boost && s_applet_boost)
+			{
+				appletCancelCpuBoostMode();
+				s_applet_boost = false;
+			}
+			return;
+		}
+
+		u32 now = 0;
+		if (R_FAILED(clkrstGetClockRate(&s_clk_cpu, &now)))
+			return;
+
+		if (boost)
+		{
+			// Not boosted yet: what the system runs at now is what to go back to.
+			if (!s_boosted)
+				s_clk_cpu_baseline = now;
+			if (now < s_clk_cpu_max)
+			{
+				const Result rc = clkrstSetClockRate(&s_clk_cpu, s_clk_cpu_max);
+				u32 after = 0;
+				clkrstGetClockRate(&s_clk_cpu, &after);
+				Console.WriteLn(Color_StrongGreen, "Switch: CPU clock boosted %u.%01u MHz -> %u.%01u MHz (rc=0x%08x)",
+					MHz(now), MHzTenth(now), MHz(after), MHzTenth(after), rc);
+			}
+			s_boosted = true;
+		}
+		else
+		{
+			if (s_boosted && s_clk_cpu_baseline != 0 && now != s_clk_cpu_baseline)
+			{
+				clkrstSetClockRate(&s_clk_cpu, s_clk_cpu_baseline);
+				Console.WriteLn("Switch: CPU clock restored to %u.%01u MHz", MHz(s_clk_cpu_baseline), MHzTenth(s_clk_cpu_baseline));
+			}
+			s_boosted = false;
+		}
 	}
 } // namespace
 
 void Horizon::InitializeClocks()
 {
 	std::lock_guard lock(s_clk_mutex);
-	if (!EnsureClockSessionLocked())
-	{
-		const Result rc_boost = appletSetCpuBoostMode(ApmCpuBoostMode_FastLoad);
-		Console.WriteLn("Switch: clkrst unavailable, requested appletSetCpuBoostMode(FastLoad) (rc=0x%08x)", rc_boost);
-		return;
-	}
+	if (!s_clk_ready)
+		s_clk_ready = OpenClockSessionLocked();
+	ApplyBoostLocked(s_boost_wanted);
+}
 
-	u32 now = 0;
-	u32 rates[32] = {};
-	PcvClockRatesListType type = PcvClockRatesListType_Invalid;
-	s32 count = 0;
-
-	const Result rc_now = clkrstGetClockRate(&s_clk_cpu, &now);
-	const Result rc_rates = clkrstGetPossibleClockRates(&s_clk_cpu, rates, 32, &type, &count);
-	if (R_FAILED(rc_now) || R_FAILED(rc_rates) || count <= 0)
-	{
-		Console.Warning("Switch: failed to query CPU clock rates (now=0x%08x, rates=0x%08x, count=%d)",
-			rc_now, rc_rates, count);
-		return;
-	}
-
-	u32 max_hz = 0;
-	if (type == PcvClockRatesListType_Range && count >= 2)
-		max_hz = rates[1];
-	else
-		max_hz = *std::max_element(rates, rates + std::min<s32>(count, 32));
-
-	if (s_clk_cpu_start == 0)
-		s_clk_cpu_start = now;
-	s_clk_cpu_max = max_hz;
-
-	u32 gpu_hz = 0;
-	if (s_clk_gpu_ready)
-		clkrstGetClockRate(&s_clk_gpu, &gpu_hz);
-
-	if (max_hz > now)
-	{
-		const Result rc_set = clkrstSetClockRate(&s_clk_cpu, max_hz);
-		u32 after = 0;
-		clkrstGetClockRate(&s_clk_cpu, &after);
-		if (R_SUCCEEDED(rc_set))
-			s_clk_cpu_set = max_hz;
-
-		Console.WriteLn(Color_StrongGreen,
-			"Switch: CPU clock boosted %u.%01u MHz -> %u.%01u MHz (target %u.%01u MHz, rc=0x%08x, GPU %u.%01u MHz)",
-			now / 1000000, (now / 100000) % 10,
-			after / 1000000, (after / 100000) % 10,
-			max_hz / 1000000, (max_hz / 100000) % 10,
-			rc_set, gpu_hz / 1000000, (gpu_hz / 100000) % 10);
-	}
-	else
-	{
-		Console.WriteLn("Switch: CPU clock at %u.%01u MHz (max %u.%01u MHz, GPU %u.%01u MHz)",
-			now / 1000000, (now / 100000) % 10,
-			max_hz / 1000000, (max_hz / 100000) % 10,
-			gpu_hz / 1000000, (gpu_hz / 100000) % 10);
-	}
+void Horizon::SetCpuBoost(bool enabled)
+{
+	std::lock_guard lock(s_clk_mutex);
+	if (enabled != s_boost_wanted)
+		Console.WriteLn("Switch: CPU boost %s", enabled ? "on" : "off");
+	s_boost_wanted = enabled;
+	ApplyBoostLocked(enabled);
 }
 
 void Horizon::RefreshCpuBoost()
 {
 	std::lock_guard lock(s_clk_mutex);
-	if (!s_clk_ready || s_clk_cpu_max == 0)
-		return;
-
-	u32 now = 0;
-	if (R_SUCCEEDED(clkrstGetClockRate(&s_clk_cpu, &now)) && now < s_clk_cpu_max)
-	{
-		if (R_SUCCEEDED(clkrstSetClockRate(&s_clk_cpu, s_clk_cpu_max)))
-			s_clk_cpu_set = s_clk_cpu_max;
-	}
+	// A dock change or resume can move the clock: when not boosted, take the system's new rate as the baseline.
+	if (s_clk_ready && !s_boosted)
+		clkrstGetClockRate(&s_clk_cpu, &s_clk_cpu_baseline);
+	ApplyBoostLocked(s_boost_wanted);
 }
 
 void Horizon::ShutdownClocks()
@@ -221,20 +239,12 @@ void Horizon::ShutdownClocks()
 	if (!s_clk_ready)
 	{
 		appletCancelCpuBoostMode();
+		s_applet_boost = false;
 		return;
 	}
 
-	if (s_clk_cpu_set != 0 && s_clk_cpu_start != 0)
-	{
-		clkrstSetClockRate(&s_clk_cpu, s_clk_cpu_start);
-		s_clk_cpu_set = 0;
-	}
+	ApplyBoostLocked(false);
 	clkrstCloseSession(&s_clk_cpu);
-	if (s_clk_gpu_ready)
-	{
-		clkrstCloseSession(&s_clk_gpu);
-		s_clk_gpu_ready = false;
-	}
 	clkrstExit();
 	s_clk_ready = false;
 }

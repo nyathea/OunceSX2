@@ -1,16 +1,15 @@
 // SPDX-FileCopyrightText: 2026 ARMSX2 Contributors
 // SPDX-License-Identifier: GPL-3.0+
 
-// Where the IOP thread runs, as pure functions of the host's processors and the settings.
-//
-// VMManager::SetEmuThreadAffinities pins the EE, GS and VU1 threads. With the IOP thread running
-// concurrently it is one more busy thread, so it takes a place in the same plans. The arithmetic
-// that decides how many threads there are, which processor each one gets and whether the GS back
-// thread still fits is here, apart from the OS calls, so a test can describe a device.
+// Where the IOP thread runs, as pure functions of the host's processors and the settings, kept
+// apart from the OS calls so a test can describe a device. VMManager::SetEmuThreadAffinities pins
+// the EE, GS and VU1 threads; with the IOP thread running concurrently it is one more busy thread
+// and takes a place in the same plans.
 //
 // The same file holds the one rule shared with ResolveMode: which processors are the performance
-// tier. ResolveMode counts them to decide whether the host has a core to spare, and the Android
-// tier mode confines the emulation threads to them, so both read the same mask.
+// tier. ResolveMode needs the tier to be readable, the Android tier mode confines the emulation
+// threads to it, and a concurrent IOP thread is kept out of a tier that is too narrow for the
+// threads, so all of them read the same mask.
 
 #pragma once
 
@@ -23,9 +22,6 @@
 
 namespace IopThread
 {
-	// ---- the performance tier ----------------------------------------------------------------
-
-	/// One processor as the topology reader sees it.
 	struct CpuCapacity
 	{
 		u32 processor_id = 0; // the OS's number for it (Linux: linux_id); the mask bit is this number
@@ -61,20 +57,50 @@ namespace IopThread
 	/// EE thread is pinned to cpu 0, a little core, with the GS and the VU1 thread on the other little ones.
 	std::vector<u32> OrderProcessors(const std::vector<CpuCapacity>& cpus);
 
-	// ---- the placement plans -------------------------------------------------------------------
-
-	/// Android's Performance Cores mode: every busy emulation thread is confined to the performance
-	/// tier and the scheduler places them within it.
+	/// Android's Performance Cores mode: the EE, GS and, with MTVU, VU1 threads are confined to the performance
+	/// tier and the scheduler places them within it. The IOP thread is not counted: it runs outside the tier
+	/// (SlowCoresMask). A host with no slower core has every processor in the tier, and ResolveMode only gives it
+	/// a concurrent IOP thread when there are two more cores than threads, so the thread still has room there.
 	struct TierPlan
 	{
-		u32 threads_to_place = 0; // EE and GS, plus the VU1 thread with MTVU, plus the IOP thread when it runs concurrently
+		u32 threads_to_place = 0; // EE and GS, plus the VU1 thread with MTVU
 		bool tier_fits = false; // the tier has a processor for each of them; otherwise nothing is confined
 		bool back_thread_fits = false; // and one more for the GS back thread, which otherwise stays unpinned
 	};
-	TierPlan PlanTier(u64 performance_mask, bool mtvu, bool iop_thread);
+	TierPlan PlanTier(u64 performance_mask, bool mtvu);
+
+	/// Whether the Linux ordered thread pin (EnableThreadPinning) may be applied: false only when the performance tier can
+	/// be read and cannot hold the EE, GS and, with MTVU, VU1 threads. The pin hands out processors fastest first, so on
+	/// a tier of two it puts the GS thread on a slow core, and measured on the MQ65 with two fast cores it lost 30 to 45%
+	/// speed in every game. The IOP thread is not counted: it goes outside the tier (SlowCoresMask). True when the
+	/// tier cannot be read (mask 0), which leaves a host that has no capacity source as it was.
+	bool OrderedPinAllowed(u64 performance_mask, bool mtvu);
+
+	/// Whether the game database's GS back-thread split fits on a host: the EE, VU1, GS front and GS back threads each
+	/// want a performance core, and a concurrent IOP thread wants a fifth. It is busy 40 to 99% of a core, and with it
+	/// running and only four big cores the split measured slower than a single GS thread in most games tried, even with
+	/// the prime core rule. That measurement had the IOP thread on the fast cores; it runs on the slow ones now and this
+	/// rule has not been measured again. There also has to be a slower core left to keep the rest off the tier: a host whose
+	/// every processor is in the tier (`performance_cores >= processors`) has none.
+	///
+	/// `iop_thread_threaded` is whether the IOP thread will actually run concurrently on this host, which is what
+	/// IopThread::ResolveMode says (Threaded), not whether the setting is on: on a host that can never give Threaded the
+	/// setting costs the split nothing.
+	bool GsSplitFits(u32 performance_cores, u32 processors, bool iop_thread_threaded);
+
+	/// The processors a concurrent IOP thread is confined to: every processor outside the performance tier, in every
+	/// placement mode, whether or not the tier could have held it. 0, meaning the caller's placement stands, when the
+	/// IOP thread takes turns with the EE (Lockstep), when the tier cannot be read, or when there is no processor
+	/// outside it.
+	///
+	/// The thread spins while it waits for the EE, so the scheduler counts it as busy. Floating, it spent 41% of its
+	/// cycles on the big cores of the RG 55G1 (two Cortex-A78, six Cortex-A55) and pushed the EE, GS and VU1 threads onto
+	/// the little ones. Confined with those three threads to the four big cores of a Dimensity 7300, it left none spare,
+	/// and emulation lost 25% while the app's UI threads drew the on-screen controls.
+	u64 SlowCoresMask(u64 performance_mask, u64 all_mask, bool concurrent);
 
 	/// Android's ranked modes (1 to 6): each thread gets one processor from the list ordered fastest
-	/// first. ee, vu and gs are ranks, as before; the caller clamps them to the list. The IOP thread
+	/// first. ee, vu and gs are ranks; the caller clamps them to the list. The IOP thread
 	/// takes the first rank none of the others uses. -1 when there is no IOP thread to place or the
 	/// list has no rank left for it: it is then left alone, never put on another thread's processor.
 	struct RankPlan
@@ -99,8 +125,6 @@ namespace IopThread
 		u32 first_software_thread = 2;
 	};
 	OrderedPlan PlanOrdered(size_t list_size, bool mtvu, bool iop_thread);
-
-	// ---- the prime core ------------------------------------------------------------------------
 
 	/// A processor is "the prime core" when it is the only one at the top capacity and the rest of the tier is at
 	/// least this far below it. The SD865 (1024 against 871) and the T820 (1024 against 869) qualify; a Dimensity

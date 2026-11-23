@@ -4,6 +4,9 @@
 // ARM64 EE (R5900) Dynamic Recompiler Core
 // Dispatcher, block management, all instructions as interpreter fallbacks.
 
+#ifdef __SWITCH__
+#include "common/Horizon/HorizonFastmem.h"
+#endif
 #include <algorithm>
 #include <atomic>
 #include <cfloat>
@@ -1956,6 +1959,16 @@ static void SetBranchBackedge()
 #endif
 }
 
+// (Ported from ARMSX2.) A fast-forward is about to jump to DispatcherEvent: tell the event test that is the way it is reached
+// (eeFastForwardKind). Clobbers RWSCRATCH and RSCRATCHADDR; every caller has flushed.
+static void emitNoteFastForward(u8 kind)
+{
+	armMoveAddressToReg(RSCRATCHADDR, &eeFastForwardKind);
+	armAsm->Ldrb(RWSCRATCH, a64::MemOperand(RSCRATCHADDR));
+	armAsm->Orr(RWSCRATCH, RWSCRATCH, kind);
+	armAsm->Strb(RWSCRATCH, a64::MemOperand(RSCRATCHADDR));
+}
+
 void SetBranchImm(u32 imm)
 {
 	if (s_loopResident && !s_loopBackedgeEmitted && imm == s_loopTopPc)
@@ -1995,6 +2008,7 @@ void SetBranchImm(u32 imm)
 		recEeNoteChargeSite(EeChargeSite::WaitLoopFastFwd);
 		armAsm->Cmp(RECCYCLE, 0);
 		armAsm->Csel(RECCYCLE, RECCYCLE, a64::xzr, a64::gt);
+		emitNoteFastForward(IopThread::FastForward::WaitLoop); // (ported from ARMSX2) the flags are dead here
 		armEmitJmp(DispatcherEvent);
 		return;
 	}
@@ -3601,7 +3615,17 @@ static bool memory_protect_recompiled_code(u32 startpc, u32 size)
 	// The EENULL thread context register is stored @ 0x81000-....
 	const bool contains_thread_stack = ((startpc >> 12) == 0x81) || ((startpc >> 12) == 0x80001);
 
-	const vtlb_ProtectionMode PageType = contains_thread_stack ? ProtMode_Manual : mmap_GetRamPageInfo(inpage_ptr);
+	vtlb_ProtectionMode PageType = contains_thread_stack ? ProtMode_Manual : mmap_GetRamPageInfo(inpage_ptr);
+#ifdef __SWITCH__
+	// SW2PS2: without the fastmem arena nothing write-protects RAM on Horizon (and
+	// the Switch 2 delivers no faults), so a "protected" page would never report a
+	// write: every RAM code page is checked at block entry instead.
+	const bool sw2_no_smc_prot = !HorizonFastmem::IsSmcProtectionActive() && !vtlb_SoftProtActive();
+	if (sw2_no_smc_prot && PageType != ProtMode_NotRequired)
+		PageType = ProtMode_Manual;
+#else
+	const bool sw2_no_smc_prot = false;
+#endif
 
 	switch (PageType)
 	{
@@ -3699,7 +3723,7 @@ static bool memory_protect_recompiled_code(u32 startpc, u32 size)
 
 			// Counted blocks: track how often this block runs. If the counter overflows,
 			// reset the page to write-protected mode (faster than manual checks).
-			if (!contains_thread_stack && manual_counter[inpage_ptr >> 12] <= 3)
+			if (!contains_thread_stack && !sw2_no_smc_prot && manual_counter[inpage_ptr >> 12] <= 3)
 			{
 				armMoveAddressToReg(RSCRATCHADDR, &manual_page[inpage_ptr >> 12]);
 				armAsm->Ldrh(RWSCRATCH, a64::MemOperand(RSCRATCHADDR));
@@ -4521,8 +4545,15 @@ static bool recSkipTimeoutLoop(s32 reg, bool is_timeout_loop)
 	armAsm->Sxtw(a64::x9, a64::w9);
 	armStoreEERegPtr(a64::x9, &cpuRegs.GPR.r[reg].UD[0]);
 
-	// if reg != 0, event interrupted the loop — go to dispatcher
-	armEmitCbnz(a64::w9, DispatcherEvent);
+	// if reg != 0, event interrupted the loop — go to dispatcher. (Ported from ARMSX2:) that jump ended in the event the loop
+	// was waiting out, so it is a fast-forward as far as the event test is concerned.
+	{
+		a64::Label loop_finished;
+		armAsm->Cbz(a64::w9, &loop_finished);
+		emitNoteFastForward(IopThread::FastForward::TimeoutLoop);
+		armEmitJmp(DispatcherEvent);
+		armAsm->Bind(&loop_finished);
+	}
 
 	// Loop finished — set PC to end of block and dispatch
 	armAsm->Mov(RWSCRATCH, s_nEndBlock);
@@ -5437,3 +5468,4 @@ R5900cpu recCpu = {
 	recCancelInstruction,
 	recClear,
 };
+

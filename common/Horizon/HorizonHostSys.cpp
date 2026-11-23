@@ -427,7 +427,10 @@ std::unique_ptr<SharedMemoryMappingArea> SharedMemoryMappingArea::Create(size_t 
 	}
 
 	virtmemLock();
-	void* const base = virtmemFindStack(size, 0);
+	// SW2PS2: only svcMapMemory targets must lie in the stack region; the code
+	// area is backed by jitCreate, so it goes in the (much larger) ASLR region
+	// and the stack region is left for the data area.
+	void* const base = jit ? virtmemFindAslr(size, 0) : virtmemFindStack(size, 0);
 	VirtmemReservation* const reservation = base ? virtmemAddReservation(base, size) : nullptr;
 	virtmemUnlock();
 	if (!base || !reservation)

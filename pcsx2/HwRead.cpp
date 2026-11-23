@@ -8,6 +8,7 @@
 #include "ps2/eeHwTraceLog.inl"
 
 #include "ps2/pgif.h"
+#include "IopThread/IopThreadVm.h"
 #include "IopThread/SharedWord.h"
 
 using namespace R5900;
@@ -70,8 +71,8 @@ mem32_t _hwRead32(u32 mem)
 			if (mem == INTC_STAT)
 			{
 				// Disable INTC hack when in PS1 mode as it seems to break games.
-				// ICFG is an IOP register, and the IOP thread can write it while this runs: a relaxed load,
-				// which is the plain load it always was.
+				// ICFG is an IOP register, and the IOP thread can write it while this runs, so it is read with a
+				// relaxed load.
 				if (intcstathack && !(SharedWord::LoadRelaxed(psxHu32(HW_ICFG)) & (1 << 3))) IntCHackCheck();
 				return psHu32(INTC_STAT);
 			}
@@ -155,13 +156,16 @@ mem32_t _hwRead32(u32 mem)
 				case SBUS_F210:
 				case SBUS_F220:
 				case SBUS_F230:
+					IopThread::EeSbusNearBound(cpuRegs.cycle);
 					return SharedWord::LoadAcquire(psHu32(mem));
 				case SBUS_F240:
+					IopThread::EeSbusNearBound(cpuRegs.cycle);
 #if PSX_EXTRALOGS
 					DevCon.Warning("Read  SBUS_F240  %x ", psHu32(SBUS_F240));
 #endif
 					return SharedWord::LoadAcquire(psHu32(SBUS_F240)) | 0xF0000102;
 				case SBUS_F260:
+					IopThread::EeSbusNearBound(cpuRegs.cycle);
 #if PSX_EXTRALOGS
 					DevCon.Warning("Read  SBUS_F260  %x ", psHu32(SBUS_F260));
 #endif
@@ -212,6 +216,12 @@ mem32_t _hwRead32(u32 mem)
 		//If STR is already unset, it won't make the slightest difference.
 		return (psHu32(mem) & ~0x100);
 	}*/
+	// The EE reading the status of a SIF DMA channel that is running is polling for the end of a transfer, which can be waiting for the IOP.
+	if constexpr (page == 0x0c)
+	{
+		if ((mem == D5_CHCR || mem == D6_CHCR) && (psHu32(mem) & 0x100)) [[unlikely]]
+			IopThread::EeNoteSifPoll();
+	}
 	return psHu32(mem);
 }
 

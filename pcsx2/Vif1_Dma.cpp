@@ -61,6 +61,7 @@ void vif1TransferToMemory()
 #endif
 
 	MTGS::InitAndReadFIFO(reinterpret_cast<u8*>(pMem), size);
+	vtlb_NotifyHostWrite(pMem, size << 4); // SW2PS2 soft code protection
 	//	pMem += size;
 
 	//Some games such as Alex Ferguson's Player Manager 2001 reads less than GSLastDownloadSize by VIF then reads the remainder by FIFO

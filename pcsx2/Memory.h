@@ -43,8 +43,13 @@ namespace HostMemoryMap
 	static constexpr u32 VTLBVirtualMapOffset = VUmemOffset + VUmemSize;
 	static constexpr u32 VTLBVirtualMapSize = (0x100000000ULL / 4096) * sizeof(void*);
 
+	// SW2PS2: VTLB write map, the same size, directly after the virtual map (the JIT reaches it as
+	// vmap + VTLB_VMAP_ITEMS). Pages holding compiled code point at the soft-protection handler here.
+	static constexpr u32 VTLBWriteMapOffset = VTLBVirtualMapOffset + VTLBVirtualMapSize;
+	static constexpr u32 VTLBWriteMapSize = VTLBVirtualMapSize;
+
 	// VTLB address map ((4GB / 4096) * sizeof(u32))
-	static constexpr u32 VTLBAddressMapOffset = VTLBVirtualMapOffset + VTLBVirtualMapSize;
+	static constexpr u32 VTLBAddressMapOffset = VTLBWriteMapOffset + VTLBWriteMapSize;
 	static constexpr u32 VTLBAddressMapSize = (0x100000000ULL / 4096) * sizeof(u32);
 
 	// Overall size.
@@ -135,6 +140,7 @@ namespace SysMemory
 	__fi static u8* GetVUMem() { return GetDataPtr(HostMemoryMap::VUmemOffset); }
 	__fi static u8* GetVUMemEnd() { return GetDataPtr(HostMemoryMap::VUmemOffset + HostMemoryMap::VUmemSize); }
 	__fi static u8* GetVTLBVirtualMap() { return GetDataPtr(HostMemoryMap::VTLBVirtualMapOffset); }
+	__fi static u8* GetVTLBWriteMap() { return GetDataPtr(HostMemoryMap::VTLBWriteMapOffset); }
 	__fi static u8* GetVTLBVirtualMapEnd() { return GetDataPtr(HostMemoryMap::VTLBVirtualMapOffset + HostMemoryMap::VTLBVirtualMapSize); }
 	__fi static u8* GetVTLBAddressMap() { return GetDataPtr(HostMemoryMap::VTLBAddressMapOffset); }
 	__fi static u8* GetVTLBAddressMapEnd() { return GetDataPtr(HostMemoryMap::VTLBAddressMapOffset + HostMemoryMap::VTLBAddressMapSize); }

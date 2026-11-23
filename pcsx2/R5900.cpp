@@ -35,6 +35,8 @@
 
 #include "fmt/format.h"
 
+u8 eeFastForwardKind = 0;  // (ported from ARMSX2) how the EE reached the next event test
+
 using namespace R5900;	// for R5900 disasm tools
 
 s32 EEsCycle;		// used to sync the IOP to the EE
@@ -499,6 +501,7 @@ __fi void _cpuEventTest_Shared()
 #ifdef PCSX2_RECOMPILER_TESTS
 	g_twinEeEventTests++;
 #endif
+	vtlb_ProcessPendingRamWrites(); // SW2PS2: code-page writes queued by the IOP thread
 	eeEventTestIsActive = true;
 	cpuRegs.nextEventCycle = cpuRegs.cycle + eeWaitCycles;
 	cpuRegs.lastEventCycle = cpuRegs.cycle;
@@ -526,6 +529,14 @@ __fi void _cpuEventTest_Shared()
 
 	// Threaded: publish where the EE has got and take what the IOP queued for it (the SBUS interrupt, a
 	// pause request), so that the interrupt checks below see it at once.
+	// (Ported from ARMSX2.) Lockstep and Threaded: how the EE got here. A fast-forward leaves its mark, which this event test takes.
+	if constexpr (M != IopThreadMode::Off)
+	{
+		const u8 ff_kind = eeFastForwardKind;
+		eeFastForwardKind = 0;
+		IopThread::g_thread.NoteEventTest(cpuRegs.cycle, ff_kind, g_FrameCount);
+	}
+
 	if constexpr (M == IopThreadMode::Threaded)
 		IopThread::EeEventTestBegin(cpuRegs.cycle);
 

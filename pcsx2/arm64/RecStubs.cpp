@@ -116,7 +116,7 @@ void vtlb_DynBackpatchLoadStore(uptr code_address, u32 code_size, u32 guest_pc, 
 			armAsm->Mov(a64::w9, armWRegister(address_register));
 
 		armAsm->Lsr(a64::w8, a64::w9, VTLB_PAGE_BITS);
-		armMoveAddressToReg(RSCRATCHADDR, vtlb_private::vtlbdata.vmap);
+		armMoveAddressToReg(RSCRATCHADDR, is_load ? vtlb_private::vtlbdata.vmap : vtlb_private::vtlbdata.vmapW);
 		armAsm->Ldr(a64::x8, a64::MemOperand(RSCRATCHADDR, a64::x8, a64::LSL, 3));
 		armAsm->Add(a64::x0, a64::x8, a64::Operand(a64::w9, a64::UXTW));
 
@@ -276,7 +276,7 @@ void vtlb_DynBackpatchLoadStore(uptr code_address, u32 code_size, u32 guest_pc, 
 
 		// Inline VTLB lookup: vmap[addr >> PAGE_BITS] → ppf
 		armAsm->Lsr(a64::w8, a64::w9, VTLB_PAGE_BITS);
-		armMoveAddressToReg(RSCRATCHADDR, vtlb_private::vtlbdata.vmap);
+		armMoveAddressToReg(RSCRATCHADDR, vtlb_private::vtlbdata.vmapW);
 		armAsm->Ldr(a64::x8, a64::MemOperand(RSCRATCHADDR, a64::x8, a64::LSL, 3));
 		armAsm->Add(a64::x0, a64::x8, a64::Operand(a64::w9, a64::UXTW));
 

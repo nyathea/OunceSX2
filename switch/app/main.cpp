@@ -43,10 +43,10 @@
 
 namespace
 {
-	constexpr const char* YADOKARI_ROOT = "sdmc:/switch/yadokari";
-	constexpr const char* GAMES_DIR = "sdmc:/switch/yadokari/games";
-	constexpr const char* LOGS_DIR = "sdmc:/switch/yadokari/logs";
-	constexpr const char* SETTINGS_PATH = "sdmc:/switch/yadokari/yadokari.ini";
+	constexpr const char* OUNCESX2_ROOT = "sdmc:/switch/OunceSX2";
+	constexpr const char* GAMES_DIR = "sdmc:/switch/OunceSX2/games";
+	constexpr const char* LOGS_DIR = "sdmc:/switch/OunceSX2/logs";
+	constexpr const char* SETTINGS_PATH = "sdmc:/switch/OunceSX2/OunceSX2.ini";
 	constexpr u64 IDLE_POLL_NS = 8'000'000ULL;
 
 	constexpr const char* USB_SETTINGS_SECTION = "Horizon";
@@ -173,6 +173,15 @@ namespace
 			if (Horizon::GetProcessCoreCount() >= 6)
 				s_settings_interface->SetIntValue("EmuCore/GS", "extrathreads", 3);
 			s_settings_interface->SetBoolValue("Horizon", "Switch2MultiCoreDefaultsV2", true);
+		}
+		// The IOP thread (ARMSX2's, with its lag control) now works on the Switch 2: the core mask is used to find
+		// the cores and its waits spin instead of WFE, which never wakes there. Lag bound as SW2PS2 measured it:
+		// one frame let IOP replies land late at boot, the 24576 default stalled FFX.
+		if (!s_settings_interface->GetBoolValue("Horizon", "Switch2IopThreadDefaultsV1", false))
+		{
+			s_settings_interface->SetBoolValue("EmuCore/Speedhacks", "iopThread", true);
+			s_settings_interface->SetIntValue("EmuCore/Speedhacks", "iopThreadLag", 98304);
+			s_settings_interface->SetBoolValue("Horizon", "Switch2IopThreadDefaultsV1", true);
 		}
 #endif
 
@@ -538,10 +547,26 @@ namespace
 	}
 } // namespace
 
+namespace
+{
+	void ApplyPerformanceModeSetting()
+	{
+		int mode;
+		{
+			auto lock = Host::GetSettingsLock();
+			mode = s_settings_interface->GetIntValue(Horizon::PerformanceModeSection, Horizon::PerformanceModeKey,
+				Horizon::DefaultCpuBoost ? 1 : 0);
+		}
+		Horizon::SetCpuBoost(mode != 0);
+	}
+} // namespace
+
 void Host::CommitBaseSettingChanges()
 {
 	if (!s_settings_interface)
 		return;
+
+	ApplyPerformanceModeSetting();
 
 	Error error;
 	if (!s_settings_interface->Save(&error))
@@ -555,7 +580,7 @@ extern "C" void userAppInit(void)
 	svcGetThreadCoreMask(&s_initial_ideal_core, &s_initial_affinity_mask, CUR_THREAD_HANDLE);
 
 	mkdir("sdmc:/switch", 0777);
-	mkdir(YADOKARI_ROOT, 0777);
+	mkdir(OUNCESX2_ROOT, 0777);
 	mkdir(GAMES_DIR, 0777);
 	mkdir(LOGS_DIR, 0777);
 
@@ -624,9 +649,9 @@ int main(int argc, char* argv[])
 
 	s_romfs_available = R_SUCCEEDED(romfsInit());
 	HorizonException::Breadcrumb(s_romfs_available ? "romfsInit ok" : "romfsInit failed");
-	EmuFolders::AppRoot = YADOKARI_ROOT;
-	EmuFolders::DataRoot = YADOKARI_ROOT;
-	EmuFolders::Settings = Path::Combine(YADOKARI_ROOT, "inis");
+	EmuFolders::AppRoot = OUNCESX2_ROOT;
+	EmuFolders::DataRoot = OUNCESX2_ROOT;
+	EmuFolders::Settings = Path::Combine(OUNCESX2_ROOT, "inis");
 	if (s_romfs_available)
 		EmuFolders::Resources = "romfs:/resources";
 	else if (!EmuFolders::SetResourcesDirectory())
@@ -643,6 +668,7 @@ int main(int argc, char* argv[])
 		ShutdownAppServices();
 		return 1;
 	}
+	ApplyPerformanceModeSetting();
 
 	HorizonException::Breadcrumb("CPUThreadInitialize");
 	if (!VMManager::Internal::CPUThreadInitialize())

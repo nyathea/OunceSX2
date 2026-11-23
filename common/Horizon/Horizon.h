@@ -17,7 +17,16 @@ namespace Horizon
 	void ReserveCore3ForCallingThread();
 	bool PinCallingThreadToCore3();
 
+	// Whether the CPU clock is raised to its highest rate while the app runs. Stored as an int in
+	// [Horizon] PerformanceMode: 0 off, anything else on.
+	static constexpr bool DefaultCpuBoost = true;
+	static constexpr const char* PerformanceModeSection = "Horizon";
+	static constexpr const char* PerformanceModeKey = "PerformanceMode";
+
 	void InitializeClocks();
+	// Raises the CPU clock to its highest rate, or gives it back to the system. Safe from any thread.
+	void SetCpuBoost(bool enabled);
+	// Re-applies the boost, for after the system has changed the clocks (resume, dock/undock).
 	void RefreshCpuBoost();
 	void ShutdownClocks();
 

@@ -6,6 +6,7 @@
 #include "Gif_Unit.h"
 #include "IopHw.h"
 #include "IopMem.h"
+#include "IopThread/IopThreadVm.h"
 
 #include "ps2/HwInternal.h"
 #include "ps2/eeHwTraceLog.inl"
@@ -159,22 +160,27 @@ void _hwWrite32( u32 mem, u32 value )
 				return;
 
 				// The SBUS registers. The IOP reads and writes the same words through its 0x1D000000 window, so
-				// every write to them is one atomic operation (SharedWord.h). F200 and F210 are plain stores
-				// (they were: the default action below), F220 sets bits, F230 clears bits.
+				// every write to them is one atomic operation (SharedWord.h). F200 and F210 are plain stores,
+				// F220 sets bits, F230 clears bits. With a lag bound above the default, each access first waits for the
+				// IOP to be within the default of the EE (IopThread::EeSbusNearBound).
 				mcase(SBUS_F200):
 				mcase(SBUS_F210):
+					IopThread::EeSbusNearBound(cpuRegs.cycle);
 					SharedWord::StoreRelease(psHu32(mem), value);
 				return;
 
 				mcase(SBUS_F220):
+					IopThread::EeSbusNearBound(cpuRegs.cycle);
 					SharedWord::FetchOr(psHu32(mem), value);
 				return;
 
 				mcase(SBUS_F230):
+					IopThread::EeSbusNearBound(cpuRegs.cycle);
 					SharedWord::FetchAnd(psHu32(mem), ~value);
 				return;
 
 				mcase(SBUS_F240):
+					IopThread::EeSbusNearBound(cpuRegs.cycle);
 					if (value & (1 << 18))
 					{
 						IopBridge::RaiseIopIrq(1);
@@ -182,7 +188,7 @@ void _hwWrite32( u32 mem, u32 value )
 					if (value & (1 << 19))
 					{
 						// PS1 mode forces the IOP thread off. This holds the IOP, stops its thread and
-						// has the EE core regenerate its dispatcher for Off (IOP thread design 9.6).
+						// has the EE core regenerate its dispatcher for Off.
 						IopBridge::Ps1Switch ps1_switch;
 						u64 cycle = psxRegs.cycle;
 						//pgifInit();
@@ -205,6 +211,7 @@ void _hwWrite32( u32 mem, u32 value )
 				return;
 
 				mcase(SBUS_F260):
+					IopThread::EeSbusNearBound(cpuRegs.cycle);
 #if PSX_EXTRALOGS
 					DevCon.Warning("Write  SBUS_F260  %x ", psHu32(SBUS_F260));
 #endif

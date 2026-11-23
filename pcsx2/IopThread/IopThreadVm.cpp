@@ -1,8 +1,10 @@
+#include <bit>
 // SPDX-FileCopyrightText: 2026 ARMSX2 Contributors
 // SPDX-License-Identifier: GPL-3.0+
 
 #include "IopThread/IopThreadVm.h"
 
+#include "CDVD/CDVD.h"
 #include "Common.h"
 #include "Config.h"
 #include "Counters.h"
@@ -22,6 +24,8 @@
 #include "R3000A.h"
 #include "R5900.h"
 #include "SIO/Sio.h"
+#include "SPU2/defs.h"
+#include "Sif.h"
 #include "VMManager.h"
 
 #include "common/ARCADE.h"
@@ -44,18 +48,26 @@ namespace IopThread
 
 	bool g_start_hold_pending = false;
 
-	// A pause the IOP thread asked for, waiting for the EE to make it.
 	std::atomic<bool> g_pause_requested{false};
 
 	namespace
 	{
-		// The testing knob for S_min (design 5.3); 0 runs a slice whenever there is budget.
+		// Minimum Threaded slice size (testing knob); 0 runs a slice whenever there is budget.
 		s32 s_min_slice = 0;
+
+		// The testing knob for Lockstep's skew (Params::lockstep_skew).
+		s64 s_lockstep_skew = 0;
+
+		// The testing knob that turns a skewed Lockstep's deferred SIF pumps into held ones (SetLockstepSkewHolds): bit 0 SIF0, bit 1 SIF1.
+		u32 s_lockstep_skew_holds = 0;
+
+		// The testing knob that keeps a record of every frame's late replies (SetReplyTrace).
+		bool s_reply_trace = false;
 
 		// The testing knob for the idle-watch window (Params::idle_spin_ns).
 		u32 s_idle_spin_ns = kDefaultIdleSpinNs;
 
-		// The pause hold (design 9.3), kept for as long as the VM stays paused.
+		// Held for as long as the VM stays paused.
 		std::optional<ScopedHold> s_pause_hold;
 
 		// The hold that keeps a Threaded thread started inside an event test stopped until the next one (g_start_hold_pending).
@@ -64,26 +76,53 @@ namespace IopThread
 		// The table the IOP thread applies E2I items with. Null is the real one (tests swap it).
 		const E2IActions* s_e2i_actions = nullptr;
 
-		// The IOP's position in EE cycles: where the EE is, less the IOP time still owed (design 3.3).
+		// The IOP's position in EE cycles: where the EE is, less the IOP time still owed.
 		// EEsCycle is negative when the IOP has run past the EE.
 		u64 IopPosition()
 		{
 			return cpuRegs.cycle - static_cast<s64>(EEsCycle);
 		}
 
-		// What the thread runs for each Lockstep request. The slice is the same code Off runs on the EE
-		// thread, iopRunSliceOnIopThread(); this only keeps the thread object's view of the IOP's position
-		// moving with the books. A reset or a state load moves the books by itself and calls ResyncClocks().
-		u64 RunIopSlice(u64 from, u64 /*target*/)
+		// Where the IOP is inside the slice it is running, for stamping what it queues for the EE (Params::iop_now). The slice
+		// functions below write it around ExecuteBlock; the IOP thread reads it from inside, so it has one thread.
+		// `ExecuteBlock` leaves psxRegs.iopCycleEE at what is still owed, so the IOP has run `budget - iopCycleEE` EE cycles
+		// since `from`, to the precision of a block (the recompiler updates it at block ends).
+		struct SliceClock
 		{
-			iopRunSliceOnIopThread();
-			return std::max(from, IopPosition());
+			u64 from = 0;
+			s32 budget = 0;
+			u64 end = 0; // where the slice ended, for what the IOP's event test does after ExecuteBlock
+			bool live = false; // inside ExecuteBlock
+		};
+		SliceClock s_slice;
+
+		u64 IopTimeNow()
+		{
+			if (!s_slice.live)
+				return s_slice.end;
+			const s64 ran = static_cast<s64>(s_slice.budget) - static_cast<s64>(psxRegs.iopCycleEE);
+			return s_slice.from + static_cast<u64>(std::max<s64>(ran, 0));
 		}
 
-		// What the thread runs for each Threaded slice (design 5.2): today's pair, with the budget the
-		// thread computed from the watermark in place of EEsCycle. A slice is not given more than half of
-		// the s32 range, which a hold's catch-up after a very long stop could otherwise exceed. EEsCycle and
-		// EEoCycle are the EE's books and are not touched.
+		// The Lockstep slice: the same code Off runs on the EE thread, iopRunSliceOnIopThread(). This only keeps
+		// the thread object's view of the IOP's position in step with the books; a reset or a state load moves
+		// the books itself and calls ResyncClocks().
+		u64 RunIopSlice(u64 from, u64 /*target*/)
+		{
+			// iopRunSliceOnIopThread runs ExecuteBlock(EEsCycle) when the IOP has an event, and nothing else that moves the clock. The
+			// books are what it runs from, so the origin is where they say the IOP is.
+			const u64 origin = IopPosition();
+			s_slice = {origin, EEsCycle, origin, iopEventAction};
+			iopRunSliceOnIopThread();
+			s_slice.live = false;
+			const u64 reached = std::max(from, IopPosition());
+			s_slice.end = reached;
+			return reached;
+		}
+
+		// The Threaded slice. The budget comes from the thread's watermark instead of EEsCycle, and the EE's
+		// books (EEsCycle, EEoCycle) are not touched. A slice gets at most half the s32 range, which a hold's
+		// catch-up after a very long stop could otherwise exceed.
 		u64 RunIopSliceThreaded(u64 from, u64 target)
 		{
 			IOP_SIDE_ASSERT();
@@ -91,12 +130,16 @@ namespace IopThread
 			const s64 owed = static_cast<s64>(target - from);
 			const s32 budget = static_cast<s32>(std::clamp<s64>(owed, INT32_MIN / 2, INT32_MAX / 2));
 			s32 remaining = budget;
+			s_slice = {from, budget, from, false};
 
 			if (budget > 0)
 				iopEventAction = true;
 			if (iopEventAction)
 			{
+				s_slice.live = true;
 				remaining = psxCpu->ExecuteBlock(budget);
+				s_slice.live = false;
+				s_slice.end = from + static_cast<u64>(std::max<s64>(static_cast<s64>(budget) - static_cast<s64>(remaining), 0));
 				iopEventAction = false;
 			}
 			iopEventTest();
@@ -107,14 +150,14 @@ namespace IopThread
 			return from + static_cast<u64>(std::max<s64>(ran, 0));
 		}
 
-		// What the EE does with an item the IOP queued (design 3.5). A CallOnEE is run by the thread object.
+		// What the EE does with an item the IOP queued. A CallOnEE is run by the thread object.
 		void HandleI2EItem(const I2EItem& item)
 		{
 			switch (item.kind)
 			{
 				case I2EKind::SbusIrq:
 					// INTC_STAT is written on the EE thread only: the EE JIT loads it inline when the IntcStat
-					// speedhack is off (design 7.1 C13).
+					// speedhack is off.
 					hwIntcIrq(INTC_SBUS);
 					break;
 				case I2EKind::PauseRequest:
@@ -128,12 +171,67 @@ namespace IopThread
 			}
 		}
 
-		// The EE-side books from where the IOP is (design 9.1, Threaded to anything): the IOP is at `pos`, so it
-		// is owed what the EE has run beyond that. Valid only while the IOP is held or stopped.
+		// The EE-side books from where the IOP is: it is owed what the EE has run beyond its published position.
+		// Valid only while the IOP is held or stopped.
 		void BooksFromThread()
 		{
 			EEsCycle = static_cast<s32>(cpuRegs.cycle - g_thread.PublishedPos());
 			EEoCycle = cpuRegs.cycle;
+		}
+
+		// LagRule::Window in the built-in set: how long the bound stays tight after the EE starts a SIF transfer, in EE cycles.
+		constexpr u32 kRequestWindow = 196608;
+
+		// The rules that tighten a large lag bound (IopLagRules.h): the built-in set.
+		LagRulesConfig DefaultRules()
+		{
+			// Three rules are on. IdleOutstanding: while the EE is idle with a request out to the IOP, it may not run ahead of the IOP by more
+			// than the tight bound (Burnout 3). Stream: while SPU2 auto-DMA is running, the same, because the EE refills the audio ring from
+			// an IOP callback and a late callback makes the SPU2 replay the ring (the Devil May Cry and Metal Gear Solid 3 intros).
+			// Window: for kRequestWindow cycles after every SIF transfer the EE starts, the same. God of War II's movie player sends a
+			// request and spins on its completion with a system call in the loop, so the EE is never idle and IdleOutstanding does not hold;
+			// at a one-frame bound each request then took a frame, the movie drew 6 to 16 fps and its sound buffer was played twice. The
+			// window is not closed by a reply: closed, it was tight for 3 percent of that movie's cycles and changed nothing. Open for
+			// 196,608 cycles it restores the movie (98,304 does not) and is tight for 2.4 percent of God of War II's gameplay.
+			// Stream also counts a call to the memory card server in progress (StreamBit::McServerCall, McServerCalls in IopLagRules.h).
+			// Samurai Warriors 2 loads its save as a series of calls (card information, open, read, close) that it polls for; at a one-frame
+			// bound the EE ran up to a frame ahead of the IOP through the calls before the first read, each end reached it late, and the game
+			// reported the good save damaged. Tight from each call's arrival on the IOP to its end (the server's end packet, or for a call
+			// with no end function the IOP's write-back into the EE's copy of the call packet), the save loads. The bit holds the bound tight
+			// for 4.2 percent of the event tests in that game's title menu, which asks for the card's information every few frames, and 2.5
+			// percent over its boot and load; for none in Burnout 3's gameplay or God of War II's movie (Threaded) or its gameplay (the
+			// Lockstep skew), which make no calls to the server there. Tracking every RPC call instead held the bound tight for about 10
+			// percent of the event tests in Samurai Warriors 2 and in God of War II's movie, nearly all of it streaming and sound servers,
+			// so only the memory card server is tracked.
+			// The other rules in IopLagRules.h are off: idling alone (IdleAny) held the bound tight for 38 to 60 percent of God of War II,
+			// and a CDVD read counted as a stream for 59 percent of it.
+			LagRulesConfig cfg;
+			cfg.mask = LagRule::Bit(LagRule::IdleOutstanding) | LagRule::Bit(LagRule::Stream) | LagRule::Bit(LagRule::Window);
+			cfg.window = kRequestWindow;
+			cfg.window_close_on_reply = false;
+			return cfg;
+		}
+
+		// The calls to the memory card server in progress, from the SIF command packets (NoteSif1ToIop, NoteSif0FromIop). Owned by
+		// whichever thread runs the IOP; ResyncClocks resets it with the IOP held or stopped.
+		McServerCalls s_mc_calls;
+
+		// What the IOP's devices are doing, sampled by the IOP thread at the end of each slice (LagRule::Stream). The SPU2 auto-DMA
+		// control word has the core's bit set while the game streams audio into that core, the drive is busy while a read or a
+		// seek is running, and the memory card server has a call in progress; all are IOP-owned state the IOP thread reads
+		// without a lock.
+		u32 SampleDeviceStreams(u64 iop_pos)
+		{
+			u32 bits = 0;
+			if (Cores[0].AutoDMACtrl & 1)
+				bits |= StreamBit::SpuAdmaCore0;
+			if (Cores[1].AutoDMACtrl & 2)
+				bits |= StreamBit::SpuAdmaCore1;
+			if (cdvd.Reading || cdvd.Action != 0) // 0 is cdvdAction_None (CDVD_internal.h, which defines a variable and cannot be included twice)
+				bits |= StreamBit::CdvdBusy;
+			if (McServerCallInProgress(iop_pos))
+				bits |= StreamBit::McServerCall;
+			return bits;
 		}
 
 		Params MakeParams()
@@ -141,10 +239,16 @@ namespace IopThread
 			Params params;
 			params.mode = s_mode;
 			params.lag = ClampLag(EmuConfig.Speedhacks.iopThreadLag);
+			params.rules = DefaultRules();
+			params.start_frame = g_FrameCount;
+			if (params.rules.mask & LagRule::Bit(LagRule::Stream))
+				params.sample_streams = SampleDeviceStreams;
 			params.min_slice = s_mode == IopThreadMode::Threaded ? s_min_slice : 0;
 			params.idle_spin_ns = s_idle_spin_ns;
 			params.start_ee_cycle = cpuRegs.cycle;
 			params.start_iop_pos = IopPosition();
+			params.iop_now = IopTimeNow;
+			params.ee_in_event_test = [] { return eeEventTestIsActive; };
 			params.fpcr = EmuConfig.Cpu.FPUFPCR;
 			params.stack_size = VMManager::EMU_THREAD_STACK_SIZE;
 			if (s_mode == IopThreadMode::Threaded)
@@ -157,8 +261,21 @@ namespace IopThread
 			else
 			{
 				params.run_slice = RunIopSlice;
+				if (s_lockstep_skew > 0)
+				{
+					// The skewed handoff runs to a target, not to what the EE's books say it owes, so it uses the
+					// Threaded slice (IOP-side only, EEsCycle untouched). RunLockstepSlice writes the books from the
+					// position the handoff returns.
+					params.lockstep_skew = s_lockstep_skew;
+					params.run_slice = RunIopSliceThreaded;
+					params.has_event = [] { return iopEventAction; };
+				}
 			}
-			params.apply_item = [](const E2IItem& item) { ApplyE2IItem(item, s_e2i_actions ? *s_e2i_actions : kRealE2IActions); };
+			params.apply_item = [](const E2IItem& item) {
+				if (item.kind == E2IKind::SifPump)
+					g_thread.CountSifDeferredApplied();
+				ApplyE2IItem(item, s_e2i_actions ? *s_e2i_actions : kRealE2IActions);
+			};
 			params.ee_cycle = [] { return static_cast<u64>(cpuRegs.cycle); };
 			params.should_stop = [] {
 				const VMState state = VMManager::GetState();
@@ -185,8 +302,6 @@ namespace IopThread
 		}
 	} // namespace
 
-	// ================================================================ choosing and starting
-
 	HostCpuInfo CurrentHostInfo()
 	{
 #if defined(ARCH_ARM64)
@@ -194,7 +309,13 @@ namespace IopThread
 #else
 		constexpr bool is_arm64 = false;
 #endif
+#ifdef __SWITCH__
+		// SW2PS2: hardware_concurrency() is 0 on Horizon; the cores this process may use are the count.
+		const u32 cores = static_cast<u32>(std::popcount(VMManager::Internal::GetPerformanceCoreMask()));
+		return MakeHostInfo(is_arm64, cores, VMManager::Internal::GetPerformanceCoreMask());
+#else
 		return MakeHostInfo(is_arm64, std::thread::hardware_concurrency(), VMManager::Internal::GetPerformanceCoreMask());
+#endif
 	}
 
 	VmConditions CurrentVmConditions()
@@ -218,7 +339,11 @@ namespace IopThread
 
 	void ChooseModeFor(const HostCpuInfo& host, const VmConditions& vm)
 	{
-		SetMode(ResolveMode(EmuConfig, host, vm));
+		const IopThreadMode m = ResolveMode(EmuConfig, host, vm);
+		Console.WriteLn("IOP thread decision: asked %d, cores %u, performance %u, vuThread %d, ps1 %d -> mode %d",
+			(int)EmuConfig.Speedhacks.iopThread, host.total_cores, host.performance_cores,
+			(int)EmuConfig.Speedhacks.vuThread, (int)vm.ps1_mode, (int)m);
+		SetMode(m);
 	}
 
 	void ChooseModeForReset()
@@ -274,8 +399,11 @@ namespace IopThread
 			StopRunningThread();
 			Console.WriteLn(Color_StrongGreen, "IOP thread: stopped.");
 		}
+		if (s_mode != IopThreadMode::Off)
+			g_thread.SetReplyTrace(s_reply_trace);
 		if (s_mode != IopThreadMode::Off && g_thread.Start(MakeParams()))
 		{
+			eeFastForwardKind = 0; // a skip made while the mode was Off has no event test to belong to
 			PerformanceMetrics::SetIOPThread(g_thread.GetThreadHandle());
 			const char* const names[] = {"Off", "Lockstep", "Threaded"};
 			Console.WriteLn(Color_StrongGreen, "IOP thread: started in %s mode.", names[static_cast<int>(s_mode)]);
@@ -321,10 +449,10 @@ namespace IopThread
 			g_thread.ReapplyFpcr(EmuConfig.Cpu.FPUFPCR);
 	}
 
-	// ================================================================ clocks and pausing
-
 	void ResyncClocks()
 	{
+		// The calls the SIF packets showed belong to the machine before the load or the reset.
+		s_mc_calls.Reset();
 		if (g_thread.IsRunning())
 			g_thread.Resync(cpuRegs.cycle, IopPosition());
 	}
@@ -362,8 +490,6 @@ namespace IopThread
 	{
 		return g_thread.GetStats();
 	}
-
-	// ================================================================ ownership asserts
 
 	namespace
 	{
@@ -480,8 +606,6 @@ namespace IopThread
 		s_violation_handler(Side::Ee, where);
 	}
 
-	// ================================================================ EE-to-IOP items
-
 	const E2IActions kRealE2IActions = {
 		[] { psxHBlankStart(); },
 		[] { psxHBlankEnd(); },
@@ -505,6 +629,7 @@ namespace IopThread
 					break;
 			}
 		},
+		[](u32 channel) { RunSifPumpOnEe(channel == 0 ? &SIF0DmaFromEe : &SIF1DmaFromEe); },
 	};
 
 	void ApplyE2IItem(const E2IItem& item, const E2IActions& actions)
@@ -529,6 +654,10 @@ namespace IopThread
 			case E2IKind::Call:
 				actions.job(item.arg);
 				break;
+			case E2IKind::SifPump:
+				pxAssertRel(actions.sif_pump, "an E2I table without a SIF pump action was given a SifPump item");
+				actions.sif_pump(item.arg);
+				break;
 			default:
 				pxFailRel("unknown E2I item kind");
 				break;
@@ -550,21 +679,24 @@ namespace IopThread
 			{
 				if (g_thread.PostE2I(stamp, kind, arg))
 				{
-					// The EE waits here until the IOP thread has applied the item, so it takes effect at this
-					// point of the EE's execution and not later.
-					g_thread.LockstepApplyUpTo(stamp);
+					// With a skew the item waits in the queue for the IOP's clock to reach the stamp (the handoff
+					// applies it); PostE2I does not fail under a skew, because what the ring cannot hold goes to a
+					// spill queue. Without one the EE waits here until the IOP thread has applied the item, so it
+					// takes effect at this point of the EE's execution and not later.
+					if (g_thread.LockstepSkew() == 0)
+						g_thread.LockstepApplyUpTo(stamp);
 					return;
 				}
+				pxAssertMsg(g_thread.LockstepSkew() == 0, "an EE-to-IOP item could not be queued under a Lockstep skew");
 			}
 			else
 			{
 				// Threaded: the IOP applies it when its own clock reaches the stamp, and the EE goes on.
 				if (g_thread.PostE2I(stamp, kind, arg))
 					return;
-				// The ring cannot make room for it while the IOP is held or blocked in a CallOnEE function
-				// (the lag bound keeps it nearly empty, so this does not happen), and the stop predicate ends a
-				// wait for room when the VM is going away. In the first case the IOP is stopped and the item can be
-				// applied here; in the second it is not, and the item is dropped with the VM.
+				// The queue can fail only while the IOP is held or blocked in a CallOnEE function (the lag bound
+				// keeps the ring nearly empty otherwise), or when the VM is going away. If the IOP is stopped,
+				// apply the item here; if the VM is going away, drop it.
 				pxAssertMsg(g_thread.IopIsStopped() || VMManager::GetState() == VMState::Stopping || VMManager::GetState() == VMState::Shutdown,
 					"an EE-to-IOP item could not be queued");
 				if (!g_thread.IopIsStopped())
@@ -576,7 +708,113 @@ namespace IopThread
 		ApplyE2IItem(E2IItem{stamp, kind, 0, arg}, s_e2i_actions ? *s_e2i_actions : kRealE2IActions);
 	}
 
-	// ================================================================ host threads and the CPU thread
+	bool DeferSifPump(u32 channel)
+	{
+		pxAssertMsg(channel <= 1, "only SIF0 and SIF1 pumps are deferred");
+		if (s_mode == IopThreadMode::Off)
+			return false;
+		// No thread, or the IOP is already stopped (a hold, a CallOnEE function): nothing to wait for, so the
+		// caller's pump runs in place, exactly as with the setting off.
+		if (!g_thread.IsRunning() || g_thread.IopIsStopped())
+			return false;
+		// The holds variant of a Lockstep skew (testing): bring the IOP up to the EE, and let the caller pump in place.
+		if (g_thread.LockstepSkew() > 0 && ((s_lockstep_skew_holds >> channel) & 1))
+		{
+			const u64 reached = g_thread.LockstepCatchUp(cpuRegs.cycle);
+			// RunLockstepSlice's books for a skew: the IOP is owed what the EE has run beyond where it is (now about nothing).
+			EEsCycle = static_cast<s32>(cpuRegs.cycle - reached);
+			EEoCycle = cpuRegs.cycle;
+			return false;
+		}
+		// A Lockstep skew always defers: pumping at once would hand the IOP the data D cycles early.
+		if (!EmuConfig.Speedhacks.iopThreadDeferSif && g_thread.LockstepSkew() == 0)
+			return false;
+		// Stamped with the EE's cycle at the moment Off would have run the pump. Lockstep applies it before
+		// this returns (ApplyOnIop waits for the IOP thread), which is Off's order.
+		ApplyOnIop(E2IKind::SifPump, channel);
+		g_thread.CountSifDeferred();
+		return true;
+	}
+
+	void EeNoteSifStart(u32 channel)
+	{
+		if (s_mode == IopThreadMode::Off || !g_thread.IsRunning())
+			return;
+		g_thread.NoteEeSifStart(cpuRegs.cycle, channel);
+	}
+
+	namespace
+	{
+		// The first words of a SIF transfer in IOP memory, enough for the RPC packets McServerCalls reads.
+		struct SifHead
+		{
+			u32 w[14];
+			u32 count;
+			SifHead(u32 madr, u32 words)
+			{
+				count = std::min<u32>(words, 14);
+				for (u32 i = 0; i < count; i++)
+					w[i] = *reinterpret_cast<const u32*>(iopPhysMem(madr + i * 4));
+			}
+		};
+	} // namespace
+
+	void NoteSif1ToIop(u32 madr, u32 words)
+	{
+		const SifHead head(madr, words);
+		s_mc_calls.OnSif1Transfer(head.w, head.count, [](u32 addr) { return *reinterpret_cast<const u32*>(iopPhysMem(addr & ~3u)); });
+	}
+
+	void NoteSif0FromIop(u32 madr, u32 words, u32 ee_dest)
+	{
+		const SifHead head(madr, words);
+		s_mc_calls.OnSif0Transfer(head.w, head.count, ee_dest);
+	}
+
+	bool McServerCallInProgress(u64 iop_pos)
+	{
+		return s_mc_calls.InProgress(iop_pos);
+	}
+
+	void EeNoteSifPoll()
+	{
+		if (s_mode == IopThreadMode::Off || !g_thread.IsRunning())
+			return;
+		g_thread.NoteEePoll(cpuRegs.cycle);
+	}
+
+	void Sif0PumpFromIop()
+	{
+		g_thread.NoteIopSif0Reply(cpuRegs.cycle);
+		SIF0Dma();
+	}
+
+	bool SyncIopForSifChannelStop(u32 channel)
+	{
+		pxAssertMsg(channel <= 1, "only the SIF0 and SIF1 channels are synchronised at a stop");
+		if (s_mode == IopThreadMode::Off)
+			return false;
+		if (!g_thread.IsRunning() || g_thread.IopIsStopped())
+			return false;
+		if (s_mode == IopThreadMode::Threaded)
+		{
+			// The IOP runs up to the EE's cycle and stops; the hold ends with the scope. What it did on the way, the IOP-started pump
+			// included, ran on this thread (the hold's spin serves it) before the scope ended.
+			ScopedHold hold(g_thread, HoldKind::Emulation);
+			return true;
+		}
+		// Lockstep: the IOP is current already unless a skew keeps it behind, and then only the holds variant catches it up at an EE event
+		// (the deferring variant would hand the IOP the stop D cycles early).
+		if (g_thread.LockstepSkew() > 0 && ((s_lockstep_skew_holds >> channel) & 1))
+		{
+			const u64 reached = g_thread.LockstepCatchUp(cpuRegs.cycle);
+			// RunLockstepSlice's books for a skew, as at a held pump.
+			EEsCycle = static_cast<s32>(cpuRegs.cycle - reached);
+			EEoCycle = cpuRegs.cycle;
+			return true;
+		}
+		return false;
+	}
 
 	bool TryPostToIop(HostCommandQueue::Command command)
 	{
@@ -588,8 +826,6 @@ namespace IopThread
 		Host::RunOnCPUThread(std::move(fn), false);
 	}
 
-	// ================================================================ the EE core's calls
-
 	bool LockstepActive()
 	{
 		return g_thread.IsRunning() && g_thread.Mode() == IopThreadMode::Lockstep;
@@ -597,7 +833,12 @@ namespace IopThread
 
 	void RunLockstepSlice()
 	{
-		g_thread.LockstepRunSlice(cpuRegs.cycle);
+		const u64 reached = g_thread.LockstepRunSlice(cpuRegs.cycle);
+		// With a skew the slice did not touch the books (it ran to a target), so they are written from where the IOP
+		// is: what it is owed is what the EE has run beyond its position, about the skew. Without one the slice has
+		// left them where Off does.
+		if (g_thread.LockstepSkew() > 0)
+			EEsCycle = static_cast<s32>(cpuRegs.cycle - reached);
 
 		// A pause the IOP asked for from inside the slice: the CPU thread makes it, and leaves its
 		// execution loop, exactly where Off would have made it.
@@ -627,8 +868,6 @@ namespace IopThread
 		VMManager::SetPaused(true);
 		Cpu->ExitExecution();
 	}
-
-	// ================================================================ Threaded: the EE's event test and SIF
 
 	namespace
 	{
@@ -681,6 +920,50 @@ namespace IopThread
 		return s_min_slice;
 	}
 
+	void SetLockstepSkew(s64 cycles)
+	{
+		s_lockstep_skew = std::clamp<s64>(cycles, 0, kMaxLag);
+	}
+
+	s64 LockstepSkewSetting()
+	{
+		return s_lockstep_skew;
+	}
+
+	void SetLockstepSkewHolds(bool holds)
+	{
+		s_lockstep_skew_holds = holds ? 3u : 0u;
+	}
+
+	void SetLockstepSkewHoldChannels(u32 mask)
+	{
+		s_lockstep_skew_holds = mask & 3u;
+	}
+
+	bool LockstepSkewHolds()
+	{
+		return s_lockstep_skew_holds != 0;
+	}
+
+	void SetReplyTrace(bool on)
+	{
+		s_reply_trace = on;
+	}
+
+	bool ReplyTrace()
+	{
+		return s_reply_trace;
+	}
+
+	void NoteDirectReply(u32 kind)
+	{
+		if (s_mode != IopThreadMode::Lockstep || !g_thread.IsRunning() || !g_thread.OnIopThread())
+			return;
+		g_thread.NoteReply(kind, static_cast<u32>(IopTimeNow()));
+		if (kind == ReplyKind::SbusIrq || kind == ReplyKind::Sif0Pump)
+			g_thread.NoteIopSif0Reply(cpuRegs.cycle);
+	}
+
 	void SetThreadedIdleSpinNs(u32 ns)
 	{
 		s_idle_spin_ns = ns;
@@ -691,16 +974,90 @@ namespace IopThread
 		return s_idle_spin_ns;
 	}
 
-	// ================================================================ counters
-
 	std::string FormatStats(const Stats& t, double frames)
 	{
 		const double f = std::max(frames, 1.0);
-		return fmt::format("W1 {:.2f}/f {:.1f} us/f (found IOP asleep {:.2f}/f {:.1f} us/f, idle {:.2f}/f {:.1f} us/f) | W2 {:.2f}/f {:.1f} us/f | I2E {:.1f}/f | SIF pumps ee {:.2f}/f iop {:.2f}/f | IOP sleeps {:.1f}/f wakes {:.1f}/f idle {:.0f} us/f | slices {:.0f}/f",
+		return fmt::format("W1 {:.2f}/f {:.1f} us/f (found IOP asleep {:.2f}/f {:.1f} us/f, idle {:.2f}/f {:.1f} us/f) | W2 {:.2f}/f {:.1f} us/f | I2E {:.1f}/f | SIF pumps ee {:.2f}/f deferred {:.2f}/f (applied {:.2f}/f) iop {:.2f}/f | SBUS near-bound waits {:.2f}/f {:.1f} us/f | IOP sleeps {:.1f}/f wakes {:.1f}/f idle {:.0f} us/f | slices {:.0f}/f | replies {:.2f}/f late {:.2f}/f idle overshoots {:.2f}/f (max {} cycles, unbroken {:.2f}/f, 90% {:.2f}/f; late but EE busy {:.2f}/f, idle light {:.2f}/f)",
 			t.lag_spins / f, t.lag_stall_ns / 1000.0 / f, t.lag_spins_parked / f, t.lag_parked_stall_ns / 1000.0 / f,
 			t.lag_spins_idle / f, t.lag_idle_stall_ns / 1000.0 / f,
 			t.emu_hold_requests / f, t.emu_hold_stall_ns / 1000.0 / f, t.i2e_drained / f,
-			t.sif_ee_pumps / f, t.calls_posted / f, t.parks / f, t.wakes_sent / f, t.idle_ns / 1000.0 / f, t.slices / f);
+			t.sif_ee_pumps / f, t.sif_deferred / f, t.sif_deferred_applied / f,
+			// CallOnEE requests are the IOP-started pumps and the deferred ones; the deferred ones have their own figure.
+			(t.calls_posted > t.sif_deferred_applied ? t.calls_posted - t.sif_deferred_applied : 0) / f,
+			t.near_waits / f, t.near_wait_ns / 1000.0 / f,
+			t.parks / f, t.wakes_sent / f, t.idle_ns / 1000.0 / f, t.slices / f,
+			t.replies / f, t.late_replies / f, t.idle_overshoots / f, t.idle_overshoot_max, t.idle_overshoots_unbroken / f, t.idle_overshoots_90 / f,
+			t.late_ee_busy / f, t.late_idle_light / f);
+	}
+
+	namespace
+	{
+		std::string HistLine(const char* what, const char* kind, const LateHist& h)
+		{
+			std::string line = fmt::format("IOPLATE: {} {} n={} mean={:.0f} max={} |", what, kind, h.count, h.Mean(), h.max);
+			for (u32 i = 0; i < kLateBuckets; i++)
+				line += fmt::format(" {}", h.bucket[i]);
+			return line;
+		}
+	} // namespace
+
+	std::vector<std::string> FormatReplyStats(const ReplyStats& r)
+	{
+		std::vector<std::string> lines;
+		std::string edges;
+		for (u32 i = 0; i < kLateEdgeCount; i++)
+			edges += fmt::format(" <{}", kLateEdges[i]);
+		edges += fmt::format(" >={}", kLateEdges[kLateEdgeCount - 1]);
+		lines.push_back(fmt::format("IOPLATE: buckets (EE cycles late):{}", edges));
+		lines.push_back(fmt::format(
+			"IOPLATE: replies={} late={} (>= {} cycles) idle_overshoots={} (idle share >= {}%) overshoot_cycles={} overshoot_max={} unbroken={} share90={} late_ee_busy={} (cycles {}) "
+			"late_idle_light={} (cycles {}) late_idle_unknown={}",
+			r.replies, r.late, kOvershootMin, r.idle_overshoots, kIdleShareMin, r.idle_overshoot_cycles, r.idle_overshoot_max, r.idle_overshoots_unbroken, r.idle_overshoots_90,
+			r.late_ee_busy, r.late_ee_busy_cycles, r.late_idle_light, r.late_idle_light_cycles, r.late_idle_unknown));
+		LateHist all_kinds, over_kinds;
+		for (u32 k = 0; k < ReplyKind::kCount; k++)
+		{
+			for (const LateHist* src : {&r.all[k], &r.overshoot[k]})
+			{
+				LateHist& dst = (src == &r.all[k]) ? all_kinds : over_kinds;
+				dst.count += src->count;
+				dst.sum += src->sum;
+				dst.max = std::max(dst.max, src->max);
+				for (u32 i = 0; i < kLateBuckets; i++)
+					dst.bucket[i] += src->bucket[i];
+			}
+		}
+		lines.push_back(HistLine("all", "total", all_kinds));
+		for (u32 k = 0; k < ReplyKind::kCount; k++)
+			if (r.all[k].count)
+				lines.push_back(HistLine("all", ReplyKind::Name(k), r.all[k]));
+		lines.push_back(HistLine("idle_overshoot", "total", over_kinds));
+		for (u32 k = 0; k < ReplyKind::kCount; k++)
+			if (r.overshoot[k].count)
+				lines.push_back(HistLine("idle_overshoot", ReplyKind::Name(k), r.overshoot[k]));
+		std::string dec;
+		for (u32 i = 0; i <= 10; i++)
+			dec += fmt::format(" {}", r.coverage_decile[i]);
+		lines.push_back(fmt::format("IOPLATE: late replies by idle share of [production, taken] in tenths (0..10):{}", dec));
+		std::string wake;
+		for (u32 i = 0; i <= 10; i++)
+			wake += fmt::format(" {}", r.wake_decile[i]);
+		lines.push_back(fmt::format("IOPLATE: idle overshoots by the share of the next {} cycles the EE then ran, in tenths (0..10):{}", kWakeWindow, wake));
+		lines.push_back(fmt::format("IOPLATE: frames={} with_overshoot={} by overshoots in the frame (0 1 2 3-4 5-8 9+): {} {} {} {} {} {}", r.frames, r.frames_with_overshoot,
+			r.frame_bins[0], r.frame_bins[1], r.frame_bins[2], r.frame_bins[3], r.frame_bins[4], r.frame_bins[5]));
+		lines.push_back(fmt::format("IOPLATE: event_tests={} ff_event_tests={} ({:.1f}%) ff_cycles={} ee_cycles={} ({:.1f}% idle)", r.event_tests, r.ff_event_tests,
+			r.event_tests ? 100.0 * r.ff_event_tests / r.event_tests : 0.0, r.ff_cycles, r.ee_cycles, r.ee_cycles ? 100.0 * r.ff_cycles / r.ee_cycles : 0.0));
+		return lines;
+	}
+
+	std::vector<std::string> FormatReplyTrace(const std::vector<FrameRecord>& trace)
+	{
+		std::vector<std::string> lines;
+		lines.reserve(trace.size());
+		for (const FrameRecord& r : trace)
+			lines.push_back(fmt::format("IOPLATE-FRAME: frame={} replies={} late={} idle_overshoots={} unbroken={} share90={} max_late={} ff_cycles={} ee_cycles={}", r.frame, r.replies,
+				r.late, r.idle_overshoots, r.unbroken, r.share90, r.max_late, r.ff_cycles, r.ee_cycles));
+		return lines;
 	}
 
 	std::string OsdStatsLine()

@@ -2713,6 +2713,20 @@ void FullscreenUI::DrawEmulationSettingsPage()
 	DrawToggleSetting(bsi, FSUI_ICONSTR(ICON_FA_USERS, "Enable IOP Thread"),
 		FSUI_CSTR("Runs the PS2's I/O processor (sound, disc, controllers and memory cards) on its own thread. A speedup on CPUs with at least four fast cores. It turns itself off on CPUs without spare cores."),
 		"EmuCore/Speedhacks", "iopThread", false);
+#ifdef __SWITCH__
+	// Host clocks are app-wide, so this is a global setting only.
+	if (!IsEditingGameSettings(bsi))
+	{
+		// An int list rather than a toggle: the key holds an integer, which a toggle's "true" would not be.
+		static constexpr const char* s_performance_modes[] = {
+			FSUI_NSTR("Off"),
+			FSUI_NSTR("CPU Boost"),
+		};
+		DrawIntListSetting(bsi, FSUI_ICONSTR(ICON_FA_BOLT, "Performance Mode"),
+			FSUI_CSTR("Raises the Switch's CPU to its highest clock speed while OunceSX2 runs. Off leaves the clock to the system, using less battery and running cooler."),
+			"Horizon", "PerformanceMode", 1, s_performance_modes, std::size(s_performance_modes), true);
+	}
+#endif
 	DrawToggleSetting(bsi, FSUI_ICONSTR(ICON_FA_WAND_MAGIC, "Automatic Performance Tuning"),
 		FSUI_CSTR("When a game keeps missing frames, tries performance settings one at a time and keeps the ones that help, saved per game."),
 		"EmuCore", "AutoTune", false);

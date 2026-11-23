@@ -177,6 +177,7 @@ void IPU0dma()
 
 	readsize = std::min(ipu0ch.qwc, (u32)ipuRegs.ctrl.OFC);
 	ipu_fifo.out.read(pMem, readsize);
+	vtlb_NotifyHostWrite(pMem, readsize << 4); // SW2PS2 soft code protection
 
 	ipu0ch.madr += readsize << 4;
 	ipu0ch.qwc -= readsize;

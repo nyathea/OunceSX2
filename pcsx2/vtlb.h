@@ -125,6 +125,13 @@ extern int vtlb_memSafeCmpBytes(u32 mem, const void* src, u32 size);
 extern bool vtlb_memSafeReadBytes(u32 mem, void* dst, u32 size);
 extern bool vtlb_memSafeWriteBytes(u32 mem, const void* src, u32 size);
 
+// SW2PS2 soft code protection: without page faults, writes to RAM pages that hold compiled code are
+// caught by the write map (JIT and vtlb_memWrite) and by explicit notifications from DMA paths.
+extern bool vtlb_SoftProtActive();
+extern void vtlb_NotifyRamWrite(u32 ram_offset, u32 size);       // ram_offset: offset into eeMem->Main
+extern void vtlb_NotifyHostWrite(const void* host, size_t size); // any host pointer; ignored outside RAM
+extern void vtlb_ProcessPendingRamWrites();                       // EE thread: clears queued from other threads
+
 using vtlb_ReadRegAllocCallback = int(*)();
 extern int vtlb_DynGenReadNonQuad(u32 bits, bool sign, bool xmm, int addr_reg, vtlb_ReadRegAllocCallback dest_reg_alloc = nullptr);
 extern int vtlb_DynGenReadNonQuad_Const(u32 bits, bool sign, bool xmm, u32 addr_const, vtlb_ReadRegAllocCallback dest_reg_alloc = nullptr);
@@ -216,6 +223,7 @@ namespace vtlb_private
 		VTLBPhysical pmap[VTLB_PMAP_ITEMS]; //2MB (VTLB_PMAP_ITEMS * sizeof(VTLBPhysical)) // PS2 physical to host physical
 
 		VTLBVirtual* vmap;                //4MB (allocated by vtlb_init) // PS2 virtual to x86 physical
+		VTLBVirtual* vmapW;               // SW2PS2: write map = vmap + VTLB_VMAP_ITEMS (soft code protection)
 
 		u32* ppmap;               //4MB (allocated by vtlb_init) // PS2 virtual to PS2 physical
 
@@ -224,6 +232,7 @@ namespace vtlb_private
 		MapData()
 		{
 			vmap = NULL;
+			vmapW = NULL;
 			ppmap = NULL;
 			fastmem_base = 0;
 		}

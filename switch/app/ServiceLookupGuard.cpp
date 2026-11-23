@@ -36,7 +36,7 @@ namespace
 {
 	constexpr Result SM_RESULT_NOT_ALLOWED = MAKERESULT(21, 8);
 	constexpr u64 PROBE_TIMEOUT_NS = 500'000'000;
-	constexpr const char* ALLOW_UNVERIFIED_FILE = "sdmc:/switch/yadokari/diag/sm-allow-unverified";
+	constexpr const char* ALLOW_UNVERIFIED_FILE = "sdmc:/switch/OunceSX2/diag/sm-allow-unverified";
 
 	struct Probe
 	{
